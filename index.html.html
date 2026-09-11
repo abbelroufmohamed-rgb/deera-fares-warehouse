@@ -1,0 +1,852 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, user-scalable=no" />
+<title>نظام إدارة المستودع | ديرة فارس للتجارة</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;500;600;700;800&family=Amiri&display=swap" rel="stylesheet">
+
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/qrcode-generator@2.0.4/dist/qrcode.js"></script>
+<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: 'Cairo', sans-serif; background: #eef1f7; color: #1a2540; }
+  input, select, textarea, button { font-family: 'Cairo', sans-serif; }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-thumb { background: #c7d0e0; border-radius: 4px; }
+  table { border-collapse: collapse; width: 100%; }
+  @media print {
+    body * { visibility: hidden; }
+    .print-area, .print-area * { visibility: visible; }
+    .print-area { position: absolute; top: 0; right: 0; left: 0; }
+    .no-print { display: none !important; }
+  }
+  .print-only-header { display: none; }
+  @media print { .print-only-header { display: block; text-align: center; margin-bottom: 14px; } }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script>
+  const firebaseConfig = {
+    apiKey: "AIzaSyBP-n5qAg2a8oNmwqVzqz8fqP1gsUCCWLw",
+    authDomain: "deera-fares-main.firebaseapp.com",
+    projectId: "deera-fares-main",
+    storageBucket: "deera-fares-main.firebasestorage.app",
+    messagingSenderId: "420564389277",
+    appId: "1:420564389277:web:534ce8eac9089a5d25f374",
+  };
+  firebase.initializeApp(firebaseConfig);
+  window.__db = firebase.firestore();
+</script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo, useRef } = React;
+const db = window.__db;
+
+/* ============ ألوان الهوية (نفس هوية تطبيق الكاشير للتناسق البصري) ============ */
+const C = {
+  navy: "#0f2557", blue: "#1d4ed8", blueSoft: "#eef2ff", border: "#e2e6ee",
+  text: "#1a2540", muted: "#64748b", success: "#059669", danger: "#dc2626", warn: "#d97706",
+};
+const cardStyle = { background: "#fff", borderRadius: 14, padding: 20, marginBottom: 18, boxShadow: "0 1px 3px rgba(15,37,87,0.06)", border: "1px solid " + C.border };
+const cardTitle = { fontWeight: 800, fontSize: 15, color: C.navy, marginBottom: 14, borderBottom: "1px solid " + C.border, paddingBottom: 10 };
+const smallLabel = { display: "block", fontSize: 12, color: C.muted, marginBottom: 5, fontWeight: 600 };
+const inputStyle2 = { width: "100%", padding: "9px 12px", border: "1px solid " + C.border, borderRadius: 8, fontSize: 13.5, background: "#fff", color: C.text };
+const smallBtn = { padding: "9px 18px", background: "linear-gradient(135deg,#1d4ed8,#0f2557)", color: "#fff", border: "none", borderRadius: 8, fontSize: 13.5, fontWeight: 700, cursor: "pointer" };
+const ghostBtn = { padding: "9px 16px", background: "#fff", color: C.blue, border: "1px solid " + C.blue, borderRadius: 8, fontSize: 13, fontWeight: 700, cursor: "pointer" };
+const th = { padding: "9px 10px", fontSize: 12, color: C.muted, fontWeight: 700, textAlign: "right", borderBottom: "2px solid " + C.border, whiteSpace: "nowrap" };
+const td = { padding: "9px 10px", fontSize: 13, borderBottom: "1px solid " + C.border, whiteSpace: "nowrap" };
+
+function fmt(n) {
+  const v = Number(n) || 0;
+  return v.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+function todayStr() { return new Date().toISOString().slice(0, 10); }
+function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
+
+const DEFAULT_INSTITUTION_ID = "default";
+const DEFAULT_INSTITUTION_NAME = "مؤسسة ديرة فارس للتجارة";
+
+/* Firestore collections — منفصلة تمامًا عن مجموعات تطبيق الكاشير، لكن بنفس المشروع */
+const USERS_DOC = db.collection("cashRecon").doc("users"); // نفس مستخدمي تطبيق الكاشير بالظبط
+const META_DOC = db.collection("cashRecon").doc("meta_default"); // نفس فروع تطبيق الكاشير
+const ITEMS_COL = db.collection("whItems");
+const MOVES_COL = db.collection("whMoves");
+const REQUESTS_COL = db.collection("whRequests");
+const COUNTS_COL = db.collection("whCounts");
+const WH_META_DOC = db.collection("whMeta").doc("default");
+
+const ROLE_LABELS = {
+  admin: "أدمن", financial_manager: "مدير مالي", accountant: "محاسب",
+  branch_manager: "مدير فرع", cashier: "كاشير", custody_holder: "أمين عهدة",
+};
+/* صلاحيات المستودع مبنية على نفس أدوار تطبيق الكاشير: الأدمن = تحكم كامل، مدير الفرع/الكاشير = يطلبوا بضاعة لفرعهم بس */
+function canManageWarehouse(role) { return role === "admin"; }
+function canRequestForBranch(role) { return ["admin", "branch_manager", "cashier"].includes(role); }
+
+/* ============ توليد QR لصنف (يشفّر كود الصنف فقط) — بيستخدم مكتبة qrcode-generator الموثوقة، بيرسم كصورة data URL ============ */
+function ItemQRCode({ code, size = 110 }) {
+  const [dataUrl, setDataUrl] = useState("");
+  useEffect(() => {
+    if (window.qrcode && code) {
+      try {
+        const qr = window.qrcode(0, "M");
+        qr.addData(String(code));
+        qr.make();
+        const cellSize = Math.max(2, Math.floor(size / qr.getModuleCount()));
+        setDataUrl(qr.createDataURL(cellSize, 4));
+      } catch (e) { setDataUrl(""); }
+    }
+  }, [code, size]);
+  if (!dataUrl) return <div style={{ width: size, height: size, background: "#f3f4f6", borderRadius: 6 }} />;
+  return <img src={dataUrl} alt="QR" style={{ width: size, height: size }} />;
+}
+
+/* ============ ماسح كاميرا حي لقراءة كود الصنف — بيستخدم مكتبة html5-qrcode، بيفتح الكاميرا مباشرة من المتصفح ============ */
+function CameraScanner({ onScan, onClose }) {
+  const regionId = "qr-scan-region-" + useRef(uid()).current;
+  const scannerRef = useRef(null);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let stopped = false;
+    const scanner = new Html5Qrcode(regionId);
+    scannerRef.current = scanner;
+    scanner.start(
+      { facingMode: "environment" },
+      { fps: 10, qrbox: { width: 230, height: 230 } },
+      (decodedText) => {
+        if (stopped) return;
+        stopped = true;
+        scanner.stop().catch(() => {}).finally(() => onScan(decodedText));
+      },
+      () => {}
+    ).catch((e) => setError("تعذر فتح الكاميرا: " + (e.message || e) + " — تأكد من السماح بالوصول للكاميرا من إعدادات المتصفح"));
+
+    return () => {
+      if (!stopped) scanner.stop().catch(() => {});
+    };
+    // eslint-disable-next-line
+  }, []);
+
+  return (
+    <div style={{
+      position: "fixed", inset: 0, background: "rgba(8,15,35,0.92)", zIndex: 1000,
+      display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 20,
+    }}>
+      <div style={{ color: "#fff", fontWeight: 700, marginBottom: 14, fontSize: 15 }}>📷 وجّه الكاميرا على كود الصنف</div>
+      <div id={regionId} style={{ width: 280, maxWidth: "90vw", borderRadius: 14, overflow: "hidden" }} />
+      {error && <div style={{ color: "#fca5a5", marginTop: 14, fontSize: 13, textAlign: "center", maxWidth: 320 }}>{error}</div>}
+      <button onClick={onClose} style={{ ...ghostBtn, marginTop: 20, background: "#fff" }}>إلغاء</button>
+    </div>
+  );
+}
+
+/* ============ شاشة تسجيل الدخول — نفس حسابات تطبيق الكاشير بالظبط ============ */
+function LoginScreen({ users, onLogin }) {
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+
+  function submit(e) {
+    e.preventDefault();
+    const u = users.find((x) => x.username.trim() === username.trim() && x.password === password);
+    if (!u) { setError("اسم المستخدم أو كلمة المرور غير صحيحة"); return; }
+    onLogin(u);
+  }
+
+  return (
+    <div style={{
+      minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center",
+      background: "radial-gradient(circle at 20% 20%, #1d4ed8 0%, #0f2557 45%, #081633 100%)", padding: 16,
+    }}>
+      <form onSubmit={submit} style={{ background: "#fff", borderRadius: 20, padding: "40px 32px", width: 360, boxShadow: "0 30px 70px rgba(3,10,30,0.5)" }}>
+        <div style={{ textAlign: "center", marginBottom: 26 }}>
+          <div style={{
+            width: 60, height: 60, borderRadius: 16, margin: "0 auto 14px", background: "linear-gradient(135deg,#1d4ed8,#0f2557)",
+            display: "flex", alignItems: "center", justifyContent: "center", fontSize: 27,
+          }}>📦</div>
+          <h2 style={{ margin: "4px 0 4px", color: C.navy, fontSize: 19, fontWeight: 800 }}>نظام إدارة المستودع</h2>
+          <div style={{ color: C.muted, fontSize: 13 }}>نفس بيانات دخولك في نظام الكاشير</div>
+        </div>
+        <label style={smallLabel}>اسم المستخدم</label>
+        <input value={username} onChange={(e) => setUsername(e.target.value)} style={{ ...inputStyle2, marginBottom: 14 }} autoFocus />
+        <label style={smallLabel}>كلمة المرور</label>
+        <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} style={{ ...inputStyle2, marginBottom: 6 }} />
+        {error && <div style={{ color: C.danger, fontSize: 13, marginTop: 6 }}>⚠️ {error}</div>}
+        <button type="submit" style={{ ...smallBtn, marginTop: 16, width: "100%", padding: "12px 0", fontSize: 15 }}>دخول</button>
+      </form>
+    </div>
+  );
+}
+
+const UNITS = ["كيلو", "جرام", "لتر", "مل", "قطعة", "كرتون", "علبة", "كيس", "دستة"];
+
+/* ============ شاشة إدارة الأصناف: إضافة/تعديل صنف بكوده وسعره وحده الأدنى — ثنائية اللغة ============ */
+function ItemsTab({ currentUser, lang, t }) {
+  const [items, setItems] = useState(null);
+  const [editingId, setEditingId] = useState(null);
+  const [form, setForm] = useState(emptyItem());
+  const [search, setSearch] = useState("");
+  const [msg, setMsg] = useState("");
+  const [showScanner, setShowScanner] = useState(false);
+  const [qrItem, setQrItem] = useState(null);
+
+  function emptyItem() { return { nameAr: "", nameEn: "", sku: "", unit: "قطعة", price: "", minStock: "", category: "", qty: 0 }; }
+
+  useEffect(() => {
+    const unsub = ITEMS_COL.orderBy("nameAr").onSnapshot((snap) => {
+      setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+    });
+    return unsub;
+  }, []);
+
+  function set(key, val) { setForm((f) => ({ ...f, [key]: val })); }
+
+  async function save() {
+    if (!form.nameAr.trim() && !form.nameEn.trim()) { setMsg(t("اكتب اسم الصنف بالعربي أو الإنجليزي", "Enter the item name in Arabic or English")); return; }
+    const code = form.sku.trim() || uid().toUpperCase();
+    try {
+      if (editingId) {
+        await ITEMS_COL.doc(editingId).update({
+          nameAr: form.nameAr.trim(), nameEn: form.nameEn.trim(), sku: code, unit: form.unit,
+          price: Number(form.price) || 0, minStock: Number(form.minStock) || 0, category: form.category.trim(),
+        });
+        setMsg(t("✅ تم تحديث الصنف", "✅ Item updated"));
+      } else {
+        await ITEMS_COL.add({
+          nameAr: form.nameAr.trim(), nameEn: form.nameEn.trim(), sku: code, unit: form.unit,
+          price: Number(form.price) || 0, minStock: Number(form.minStock) || 0, category: form.category.trim(),
+          qty: 0, institutionId: DEFAULT_INSTITUTION_ID, createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+        });
+        setMsg(t("✅ تم إضافة الصنف — سجّل أول كمية وارد من تبويب \"وارد للمستودع\"", "✅ Item added — record first stock-in from the \"Stock In\" tab"));
+      }
+      setForm(emptyItem()); setEditingId(null);
+    } catch (e) { setMsg("Error: " + e.message); }
+  }
+
+  function editItem(it) {
+    setForm({ nameAr: it.nameAr || "", nameEn: it.nameEn || "", sku: it.sku || "", unit: it.unit || "قطعة", price: it.price || "", minStock: it.minStock || "", category: it.category || "" });
+    setEditingId(it.id);
+  }
+  async function removeItem(it) {
+    if (!confirm(t(`حذف الصنف "${it.nameAr}"؟`, `Delete item "${it.nameEn || it.nameAr}"?`))) return;
+    await ITEMS_COL.doc(it.id).delete();
+  }
+
+  const filtered = (items || []).filter((it) => {
+    const s = search.trim().toLowerCase();
+    if (!s) return true;
+    return (it.nameAr || "").toLowerCase().includes(s) || (it.nameEn || "").toLowerCase().includes(s) || (it.sku || "").toLowerCase().includes(s);
+  });
+
+  function onScanFound(code) {
+    setShowScanner(false);
+    const found = (items || []).find((it) => it.sku === code);
+    if (found) { editItem(found); setMsg(t("تم العثور على الصنف بالمسح", "Item found by scan")); }
+    else { setMsg(t("الكود ده مش مسجّل لأي صنف", "This code isn't registered to any item")); }
+  }
+
+  return (
+    <div>
+      <div style={cardStyle}>
+        <div style={cardTitle}>{editingId ? t("✏️ تعديل صنف", "✏️ Edit item") : t("➕ صنف جديد", "➕ New item")}</div>
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+          <div style={{ flex: "1 1 200px" }}>
+            <label style={smallLabel}>{t("اسم الصنف (عربي)", "Item name (Arabic)")}</label>
+            <input value={form.nameAr} onChange={(e) => set("nameAr", e.target.value)} style={inputStyle2} placeholder="بن قهوة عربي" />
+          </div>
+          <div style={{ flex: "1 1 200px" }}>
+            <label style={smallLabel}>{t("اسم الصنف (إنجليزي)", "Item name (English)")}</label>
+            <input value={form.nameEn} onChange={(e) => set("nameEn", e.target.value)} style={inputStyle2} placeholder="Arabic Coffee Beans" />
+          </div>
+          <div style={{ flex: "1 1 160px" }}>
+            <label style={smallLabel}>{t("كود الصنف (اختياري)", "Item code (optional)")}</label>
+            <div style={{ display: "flex", gap: 6 }}>
+              <input value={form.sku} onChange={(e) => set("sku", e.target.value)} style={inputStyle2} placeholder={t("سيتولّد تلقائيًا", "Auto-generated")} />
+              <button type="button" onClick={() => setShowScanner(true)} style={{ ...ghostBtn, padding: "0 12px" }}>📷</button>
+            </div>
+          </div>
+          <div style={{ flex: "1 1 120px" }}>
+            <label style={smallLabel}>{t("وحدة القياس", "Unit")}</label>
+            <select value={form.unit} onChange={(e) => set("unit", e.target.value)} style={inputStyle2}>
+              {UNITS.map((u) => <option key={u} value={u}>{u}</option>)}
+            </select>
+          </div>
+          <div style={{ flex: "1 1 130px" }}>
+            <label style={smallLabel}>{t("سعر الوحدة (ر.س)", "Unit price (SAR)")}</label>
+            <input type="number" step="0.01" value={form.price} onChange={(e) => set("price", e.target.value)} style={inputStyle2} />
+          </div>
+          <div style={{ flex: "1 1 130px" }}>
+            <label style={smallLabel}>{t("حد أدنى للتنبيه", "Min stock alert")}</label>
+            <input type="number" step="0.01" value={form.minStock} onChange={(e) => set("minStock", e.target.value)} style={inputStyle2} />
+          </div>
+          <div style={{ flex: "1 1 150px" }}>
+            <label style={smallLabel}>{t("الفئة (اختياري)", "Category (optional)")}</label>
+            <input value={form.category} onChange={(e) => set("category", e.target.value)} style={inputStyle2} />
+          </div>
+        </div>
+        <div style={{ marginTop: 14, display: "flex", gap: 10, alignItems: "center" }}>
+          <button onClick={save} style={smallBtn}>{editingId ? t("💾 حفظ التعديل", "💾 Save changes") : t("➕ إضافة الصنف", "➕ Add item")}</button>
+          {editingId && <button onClick={() => { setForm(emptyItem()); setEditingId(null); }} style={ghostBtn}>{t("إلغاء", "Cancel")}</button>}
+          {msg && <span style={{ fontSize: 13, color: msg.startsWith("✅") ? C.success : C.danger }}>{msg}</span>}
+        </div>
+      </div>
+
+      <div style={cardStyle}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14, flexWrap: "wrap", gap: 10 }}>
+          <div style={{ ...cardTitle, marginBottom: 0, border: "none", padding: 0 }}>📋 {t("كل الأصناف", "All items")} ({(items || []).length})</div>
+          <input value={search} onChange={(e) => setSearch(e.target.value)} style={{ ...inputStyle2, maxWidth: 240 }} placeholder={t("بحث بالاسم أو الكود...", "Search name or code...")} />
+        </div>
+        <div style={{ overflowX: "auto" }}>
+          <table>
+            <thead><tr>
+              <th style={th}>{t("الاسم", "Name")}</th><th style={th}>{t("الكود", "Code")}</th><th style={th}>{t("الوحدة", "Unit")}</th>
+              <th style={th}>{t("السعر", "Price")}</th><th style={th}>{t("الرصيد الحالي", "Current qty")}</th><th style={th}>{t("قيمة المخزون", "Stock value")}</th>
+              <th style={th}>QR</th><th style={th}></th>
+            </tr></thead>
+            <tbody>
+              {filtered.map((it) => {
+                const low = it.minStock > 0 && (it.qty || 0) <= it.minStock;
+                return (
+                  <tr key={it.id} style={{ background: low ? "#fef2f2" : undefined }}>
+                    <td style={td}>
+                      <div style={{ fontWeight: 700 }}>{lang === "ar" ? (it.nameAr || it.nameEn) : (it.nameEn || it.nameAr)}</div>
+                      {it.category && <div style={{ fontSize: 11, color: C.muted }}>{it.category}</div>}
+                    </td>
+                    <td style={td}>{it.sku}</td>
+                    <td style={td}>{it.unit}</td>
+                    <td style={td}>{fmt(it.price)}</td>
+                    <td style={{ ...td, fontWeight: 800, color: low ? C.danger : C.navy }}>{fmt(it.qty)} {low && "⚠️"}</td>
+                    <td style={td}>{fmt((it.qty || 0) * (it.price || 0))}</td>
+                    <td style={td}><span onClick={() => setQrItem(it)} style={{ cursor: "pointer", color: C.blue, fontWeight: 700 }}>{t("عرض/طباعة", "View/Print")}</span></td>
+                    <td style={td}>
+                      <span onClick={() => editItem(it)} style={{ cursor: "pointer", color: C.blue, fontWeight: 700, marginLeft: 10 }}>{t("تعديل", "Edit")}</span>
+                      <span onClick={() => removeItem(it)} style={{ cursor: "pointer", color: C.danger, fontWeight: 700 }}>{t("حذف", "Delete")}</span>
+                    </td>
+                  </tr>
+                );
+              })}
+              {filtered.length === 0 && <tr><td colSpan={8} style={{ ...td, textAlign: "center", color: "#9ca3af" }}>{t("لا يوجد أصناف", "No items")}</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {showScanner && <CameraScanner onScan={onScanFound} onClose={() => setShowScanner(false)} />}
+      {qrItem && <ItemLabelModal item={qrItem} lang={lang} t={t} onClose={() => setQrItem(null)} />}
+    </div>
+  );
+}
+
+/* ============ نافذة عرض/طباعة ملصق الباركود لصنف واحد ============ */
+function ItemLabelModal({ item, lang, t, onClose }) {
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(8,15,35,0.6)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }} className="no-print">
+      <div style={{ background: "#fff", borderRadius: 16, padding: 26, maxWidth: 320, textAlign: "center" }}>
+        <div className="print-area" style={{ border: "1px dashed " + C.border, borderRadius: 10, padding: 16 }}>
+          <div style={{ fontWeight: 800, fontSize: 14, color: C.navy, marginBottom: 4 }}>{lang === "ar" ? (item.nameAr || item.nameEn) : (item.nameEn || item.nameAr)}</div>
+          <div style={{ fontSize: 12, color: C.muted, marginBottom: 10 }}>{fmt(item.price)} {t("ر.س", "SAR")} / {item.unit}</div>
+          <div style={{ display: "flex", justifyContent: "center" }}><ItemQRCode code={item.sku} size={130} /></div>
+          <div style={{ fontSize: 11, color: C.muted, marginTop: 8, fontFamily: "monospace" }}>{item.sku}</div>
+        </div>
+        <div style={{ display: "flex", gap: 10, justifyContent: "center", marginTop: 16 }} className="no-print">
+          <button onClick={() => window.print()} style={smallBtn}>🖨️ {t("طباعة", "Print")}</button>
+          <button onClick={onClose} style={ghostBtn}>{t("إغلاق", "Close")}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============ منتقي صنف بالبحث أو مسح الكاميرا — مستخدم في الوارد/الصادر/الجرد ============ */
+function ItemPicker({ items, lang, t, onPick, selectedItem }) {
+  const [search, setSearch] = useState("");
+  const [showScanner, setShowScanner] = useState(false);
+  const filtered = items.filter((it) => {
+    const s = search.trim().toLowerCase();
+    if (!s) return false;
+    return (it.nameAr || "").toLowerCase().includes(s) || (it.nameEn || "").toLowerCase().includes(s) || (it.sku || "").toLowerCase().includes(s);
+  }).slice(0, 8);
+
+  function onScanFound(code) {
+    setShowScanner(false);
+    const found = items.find((it) => it.sku === code);
+    if (found) onPick(found);
+    else alert(t("الكود ده مش مسجّل لأي صنف", "This code isn't registered to any item"));
+  }
+
+  return (
+    <div>
+      <label style={smallLabel}>{t("اختر الصنف (اكتب أو امسح بالكاميرا)", "Choose item (type or scan)")}</label>
+      <div style={{ display: "flex", gap: 6, position: "relative" }}>
+        <input value={selectedItem ? (lang === "ar" ? (selectedItem.nameAr || selectedItem.nameEn) : (selectedItem.nameEn || selectedItem.nameAr)) : search}
+          onChange={(e) => { setSearch(e.target.value); onPick(null); }} style={inputStyle2}
+          placeholder={t("اكتب اسم الصنف...", "Type item name...")} />
+        <button type="button" onClick={() => setShowScanner(true)} style={{ ...smallBtn, padding: "0 16px" }}>📷</button>
+        {!selectedItem && search && filtered.length > 0 && (
+          <div style={{ position: "absolute", top: "100%", right: 0, left: 60, background: "#fff", border: "1px solid " + C.border, borderRadius: 8, marginTop: 4, zIndex: 10, boxShadow: "0 8px 20px rgba(0,0,0,0.1)" }}>
+            {filtered.map((it) => (
+              <div key={it.id} onClick={() => { onPick(it); setSearch(""); }} style={{ padding: "8px 12px", cursor: "pointer", fontSize: 13, borderBottom: "1px solid " + C.border }}>
+                <div style={{ fontWeight: 700 }}>{lang === "ar" ? (it.nameAr || it.nameEn) : (it.nameEn || it.nameAr)}</div>
+                <div style={{ fontSize: 11, color: C.muted }}>{it.sku} — {t("الرصيد", "Qty")}: {fmt(it.qty)}</div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+      {showScanner && <CameraScanner onScan={onScanFound} onClose={() => setShowScanner(false)} />}
+    </div>
+  );
+}
+
+/* ============ شاشة وارد للمستودع (استلام بضاعة) ============ */
+function StockInTab({ currentUser, lang, t }) {
+  const [items, setItems] = useState([]);
+  const [selectedItem, setSelectedItem] = useState(null);
+  const [qty, setQty] = useState("");
+  const [note, setNote] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [recent, setRecent] = useState([]);
+
+  useEffect(() => {
+    const unsub = ITEMS_COL.orderBy("nameAr").onSnapshot((snap) => setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
+    return unsub;
+  }, []);
+  useEffect(() => {
+    const unsub = MOVES_COL.where("type", "==", "in").orderBy("createdAt", "desc").limit(15).onSnapshot(
+      (snap) => setRecent(snap.docs.map((d) => ({ id: d.id, ...d.data() }))),
+      () => {
+        // fallback بدون ترتيب مركّب لو الفهرس مش جاهز
+        MOVES_COL.orderBy("createdAt", "desc").limit(60).onSnapshot((snap) => {
+          setRecent(snap.docs.map((d) => ({ id: d.id, ...d.data() })).filter((m) => m.type === "in").slice(0, 15));
+        });
+      }
+    );
+    return unsub;
+  }, []);
+
+  async function submit() {
+    const q = Number(qty);
+    if (!selectedItem) { setMsg(t("اختر الصنف أولًا", "Choose an item first")); return; }
+    if (!q || q <= 0) { setMsg(t("أدخل كمية صحيحة أكبر من صفر", "Enter a quantity greater than zero")); return; }
+    setSaving(true); setMsg("");
+    try {
+      await db.runTransaction(async (tx) => {
+        const ref = ITEMS_COL.doc(selectedItem.id);
+        const snap = await tx.get(ref);
+        const curQty = Number(snap.data().qty) || 0;
+        tx.update(ref, { qty: curQty + q });
+        tx.set(MOVES_COL.doc(), {
+          itemId: selectedItem.id, itemName: selectedItem.nameAr, type: "in", qty: q, date: todayStr(),
+          note: note.trim(), enteredBy: currentUser.name, institutionId: DEFAULT_INSTITUTION_ID,
+          createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+        });
+      });
+      setMsg("✅ " + t(`تم إضافة ${fmt(q)} ${selectedItem.unit} للمخزون`, `Added ${fmt(q)} ${selectedItem.unit} to stock`));
+      setSelectedItem(null); setQty(""); setNote("");
+    } catch (e) { setMsg("Error: " + e.message); }
+    setSaving(false);
+  }
+
+  return (
+    <div>
+      <div style={cardStyle}>
+        <div style={cardTitle}>📥 {t("وارد للمستودع (استلام بضاعة)", "Stock In (Goods Receipt)")}</div>
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-end" }}>
+          <div style={{ flex: "1 1 260px" }}>
+            <ItemPicker items={items} lang={lang} t={t} onPick={setSelectedItem} selectedItem={selectedItem} />
+          </div>
+          <div style={{ flex: "1 1 130px" }}>
+            <label style={smallLabel}>{t("الكمية", "Quantity")} {selectedItem && `(${selectedItem.unit})`}</label>
+            <input type="number" step="0.01" value={qty} onChange={(e) => setQty(e.target.value)} style={inputStyle2} />
+          </div>
+          <div style={{ flex: "1 1 200px" }}>
+            <label style={smallLabel}>{t("ملاحظة (اختياري)", "Note (optional)")}</label>
+            <input value={note} onChange={(e) => setNote(e.target.value)} style={inputStyle2} placeholder={t("مثال: توريد من المورد الأساسي", "e.g. supplier delivery")} />
+          </div>
+          <button onClick={submit} disabled={saving} style={smallBtn}>{saving ? t("جارِ الحفظ...", "Saving...") : "💾 " + t("تسجيل الوارد", "Record receipt")}</button>
+        </div>
+        {msg && <div style={{ marginTop: 10, fontSize: 13.5, color: msg.startsWith("✅") ? C.success : C.danger }}>{msg}</div>}
+      </div>
+
+      <div style={cardStyle}>
+        <div style={cardTitle}>🕒 {t("آخر عمليات الوارد", "Recent stock-in entries")}</div>
+        <div style={{ overflowX: "auto" }}>
+          <table>
+            <thead><tr><th style={th}>{t("التاريخ", "Date")}</th><th style={th}>{t("الصنف", "Item")}</th><th style={th}>{t("الكمية", "Qty")}</th><th style={th}>{t("بواسطة", "By")}</th><th style={th}>{t("ملاحظة", "Note")}</th></tr></thead>
+            <tbody>
+              {recent.map((m) => (
+                <tr key={m.id}><td style={td}>{m.date}</td><td style={td}>{m.itemName}</td><td style={{ ...td, color: C.success, fontWeight: 700 }}>+{fmt(m.qty)}</td><td style={td}>{m.enteredBy}</td><td style={td}>{m.note || "—"}</td></tr>
+              ))}
+              {recent.length === 0 && <tr><td colSpan={5} style={{ ...td, textAlign: "center", color: "#9ca3af" }}>{t("لا يوجد بعد", "None yet")}</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============ شاشة صرف للفروع (صادر) — بتسمح بصرف أكتر من المتاح مع تنبيه واضح، والقرار يبقى للمستخدم ============ */
+function StockOutTab({ currentUser, meta, lang, t, institutionName }) {
+  const [items, setItems] = useState([]);
+  const [selectedItem, setSelectedItem] = useState(null);
+  const [qty, setQty] = useState("");
+  const [branch, setBranch] = useState("");
+  const [note, setNote] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [freshVoucher, setFreshVoucher] = useState(null);
+
+  useEffect(() => {
+    const unsub = ITEMS_COL.orderBy("nameAr").onSnapshot((snap) => setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
+    return unsub;
+  }, []);
+  useEffect(() => { if (!branch && meta.branches?.length) setBranch(meta.branches[0]); }, [meta.branches]);
+
+  const availableQty = selectedItem ? Number(selectedItem.qty) || 0 : null;
+  const exceeds = selectedItem && Number(qty) > availableQty;
+
+  async function submit() {
+    const q = Number(qty);
+    if (!selectedItem) { setMsg(t("اختر الصنف أولًا", "Choose an item first")); return; }
+    if (!q || q <= 0) { setMsg(t("أدخل كمية صحيحة أكبر من صفر", "Enter a quantity greater than zero")); return; }
+    if (!branch) { setMsg(t("اختر الفرع المستلم", "Choose the receiving branch")); return; }
+    if (exceeds && !confirm(t(
+      `المتاح فعليًا ${fmt(availableQty)} بس، وأنت بتصرف ${fmt(q)}. هيصبح الرصيد سالب. متأكد تكمّل؟`,
+      `Only ${fmt(availableQty)} available, but you're issuing ${fmt(q)}. Stock will go negative. Continue?`
+    ))) return;
+
+    setSaving(true); setMsg("");
+    try {
+      let moveId;
+      await db.runTransaction(async (tx) => {
+        const ref = ITEMS_COL.doc(selectedItem.id);
+        const snap = await tx.get(ref);
+        const curQty = Number(snap.data().qty) || 0;
+        tx.update(ref, { qty: curQty - q });
+        const moveRef = MOVES_COL.doc();
+        moveId = moveRef.id;
+        tx.set(moveRef, {
+          itemId: selectedItem.id, itemName: selectedItem.nameAr, itemNameEn: selectedItem.nameEn, unit: selectedItem.unit,
+          price: selectedItem.price, type: "out", qty: q, branch, date: todayStr(),
+          note: note.trim(), enteredBy: currentUser.name, institutionId: DEFAULT_INSTITUTION_ID,
+          createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+        });
+      });
+      setMsg("✅ " + t(`تم صرف ${fmt(q)} ${selectedItem.unit} لفرع ${branch}`, `Issued ${fmt(q)} ${selectedItem.unit} to ${branch}`));
+      setFreshVoucher({ id: moveId, itemName: selectedItem.nameAr, itemNameEn: selectedItem.nameEn, unit: selectedItem.unit, qty: q, price: selectedItem.price, branch, date: todayStr(), note, enteredBy: currentUser.name });
+      setSelectedItem(null); setQty(""); setNote("");
+    } catch (e) { setMsg("Error: " + e.message); }
+    setSaving(false);
+  }
+
+  return (
+    <div>
+      <div style={cardStyle} className="no-print">
+        <div style={cardTitle}>📤 {t("صرف بضاعة لفرع", "Issue Goods to Branch")}</div>
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-end" }}>
+          <div style={{ flex: "1 1 260px" }}>
+            <ItemPicker items={items} lang={lang} t={t} onPick={setSelectedItem} selectedItem={selectedItem} />
+          </div>
+          <div style={{ flex: "1 1 130px" }}>
+            <label style={smallLabel}>{t("الكمية", "Quantity")} {selectedItem && `(${selectedItem.unit})`}</label>
+            <input type="number" step="0.01" value={qty} onChange={(e) => setQty(e.target.value)} style={{ ...inputStyle2, borderColor: exceeds ? C.warn : C.border }} />
+          </div>
+          <div style={{ flex: "1 1 160px" }}>
+            <label style={smallLabel}>{t("الفرع المستلم", "Receiving branch")}</label>
+            <select value={branch} onChange={(e) => setBranch(e.target.value)} style={inputStyle2}>
+              {(meta.branches || []).map((b) => <option key={b} value={b}>{b}</option>)}
+            </select>
+          </div>
+          <div style={{ flex: "1 1 180px" }}>
+            <label style={smallLabel}>{t("ملاحظة (اختياري)", "Note (optional)")}</label>
+            <input value={note} onChange={(e) => setNote(e.target.value)} style={inputStyle2} />
+          </div>
+          <button onClick={submit} disabled={saving} style={smallBtn}>{saving ? t("جارِ الحفظ...", "Saving...") : "💾 " + t("تسجيل الصرف", "Record issue")}</button>
+        </div>
+        {selectedItem && (
+          <div style={{ marginTop: 10, fontSize: 12.5, color: exceeds ? C.warn : C.muted }}>
+            {exceeds ? "⚠️ " : ""}{t("المتاح فعليًا:", "Available:")} {fmt(availableQty)} {selectedItem.unit}
+            {exceeds && " — " + t("الكمية المطلوبة أكبر من المتاح", "Requested quantity exceeds available stock")}
+          </div>
+        )}
+        {msg && <div style={{ marginTop: 10, fontSize: 13.5, color: msg.startsWith("✅") ? C.success : C.danger }}>{msg}</div>}
+      </div>
+
+      {freshVoucher && <StockOutVoucher voucher={freshVoucher} institutionName={institutionName} lang={lang} t={t} onClose={() => setFreshVoucher(null)} />}
+    </div>
+  );
+}
+
+/* ============ سند صرف بضاعة رسمي قابل للطباعة ============ */
+function StockOutVoucher({ voucher, institutionName, lang, t, onClose }) {
+  return (
+    <div>
+      <div className="no-print" style={{ display: "flex", gap: 10, marginBottom: 14 }}>
+        <button onClick={() => window.print()} style={smallBtn}>🖨️ {t("طباعة سند الصرف", "Print issue voucher")}</button>
+        <button onClick={onClose} style={ghostBtn}>{t("إغلاق", "Close")}</button>
+      </div>
+      <div className="print-area">
+        <div className="print-only-header"><h2>{institutionName}</h2><div>{t("سند صرف بضاعة من المستودع", "Warehouse Goods Issue Voucher")}</div></div>
+        <div style={{ ...cardStyle, border: "2px solid " + C.navy }}>
+          <div style={{ textAlign: "center", marginBottom: 16 }}>
+            <div style={{ fontWeight: 800, fontSize: 17, color: C.navy }}>{institutionName}</div>
+            <div style={{ fontSize: 13, color: C.muted }}>{t("سند صرف بضاعة", "Goods Issue Voucher")}</div>
+          </div>
+          <table>
+            <tbody>
+              <tr><td style={{ ...td, fontWeight: 700, width: 140 }}>{t("التاريخ", "Date")}</td><td style={td}>{voucher.date}</td></tr>
+              <tr><td style={{ ...td, fontWeight: 700 }}>{t("الصنف", "Item")}</td><td style={td}>{lang === "ar" ? voucher.itemName : (voucher.itemNameEn || voucher.itemName)}</td></tr>
+              <tr><td style={{ ...td, fontWeight: 700 }}>{t("الكمية", "Quantity")}</td><td style={{ ...td, fontWeight: 800, fontSize: 15 }}>{fmt(voucher.qty)} {voucher.unit}</td></tr>
+              <tr><td style={{ ...td, fontWeight: 700 }}>{t("الفرع المستلم", "Receiving branch")}</td><td style={td}>{voucher.branch}</td></tr>
+              <tr><td style={{ ...td, fontWeight: 700 }}>{t("القيمة التقديرية", "Estimated value")}</td><td style={td}>{fmt(voucher.qty * (voucher.price || 0))} {t("ر.س", "SAR")}</td></tr>
+              {voucher.note && <tr><td style={{ ...td, fontWeight: 700 }}>{t("ملاحظة", "Note")}</td><td style={td}>{voucher.note}</td></tr>}
+            </tbody>
+          </table>
+          <div style={{ display: "flex", justifyContent: "space-between", marginTop: 30, fontSize: 12.5 }}>
+            <div style={{ textAlign: "center", flex: 1 }}><div style={{ borderTop: "1px solid " + C.text, width: 130, margin: "0 auto 6px" }} /> {t("أمين المستودع", "Storekeeper")}</div>
+            <div style={{ textAlign: "center", flex: 1 }}><div style={{ borderTop: "1px solid " + C.text, width: 130, margin: "0 auto 6px" }} /> {t("مستلم الفرع", "Branch receiver")}</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============ تقرير المخزون: القيمة الإجمالية + استهلاك كل فرع ============ */
+function ReportsTab({ lang, t, institutionName }) {
+  const [items, setItems] = useState([]);
+  const [moves, setMoves] = useState([]);
+  const [fromDate, setFromDate] = useState(new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().slice(0, 10));
+  const [toDate, setToDate] = useState(todayStr());
+  const [mode, setMode] = useState("stock"); // stock | branch
+
+  useEffect(() => {
+    const unsub = ITEMS_COL.orderBy("nameAr").onSnapshot((snap) => setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
+    return unsub;
+  }, []);
+  useEffect(() => {
+    const unsub = MOVES_COL.orderBy("createdAt", "desc").limit(3000).onSnapshot((snap) => setMoves(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
+    return unsub;
+  }, []);
+
+  const totalValue = items.reduce((s, it) => s + (Number(it.qty) || 0) * (Number(it.price) || 0), 0);
+  const lowStockItems = items.filter((it) => it.minStock > 0 && (it.qty || 0) <= it.minStock);
+
+  const rangeMoves = moves.filter((m) => m.date >= fromDate && m.date <= toDate);
+  const byBranch = useMemo(() => {
+    const map = {};
+    rangeMoves.filter((m) => m.type === "out").forEach((m) => {
+      const key = m.branch || "—";
+      if (!map[key]) map[key] = { branch: key, qtyTotal: 0, valueTotal: 0, items: {} };
+      map[key].qtyTotal += Number(m.qty) || 0;
+      map[key].valueTotal += (Number(m.qty) || 0) * (Number(m.price) || 0);
+      const itKey = m.itemName;
+      map[key].items[itKey] = (map[key].items[itKey] || 0) + (Number(m.qty) || 0);
+    });
+    return Object.values(map).sort((a, b) => b.valueTotal - a.valueTotal);
+    // eslint-disable-next-line
+  }, [rangeMoves]);
+
+  function doPrint() { window.print(); }
+
+  return (
+    <div>
+      <div style={cardStyle} className="no-print">
+        <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
+          <button onClick={() => setMode("stock")} style={mode === "stock" ? smallBtn : ghostBtn}>{t("المخزون الحالي والقيمة", "Current stock & value")}</button>
+          <button onClick={() => setMode("branch")} style={mode === "branch" ? smallBtn : ghostBtn}>{t("استهلاك الفروع", "Branch consumption")}</button>
+        </div>
+        {mode === "branch" && (
+          <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+            <div><label style={smallLabel}>{t("من تاريخ", "From")}</label><input type="date" value={fromDate} onChange={(e) => setFromDate(e.target.value)} style={inputStyle2} /></div>
+            <div><label style={smallLabel}>{t("إلى تاريخ", "To")}</label><input type="date" value={toDate} onChange={(e) => setToDate(e.target.value)} style={inputStyle2} /></div>
+          </div>
+        )}
+      </div>
+
+      <div className="print-area">
+        <div className="print-only-header"><h2>{institutionName}</h2><div>{mode === "stock" ? t("تقرير المخزون الحالي", "Current Stock Report") : t("تقرير استهلاك الفروع", "Branch Consumption Report")}</div></div>
+
+        {mode === "stock" ? (
+          <>
+            <div style={cardStyle}>
+              <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                <div style={{ flex: "1 1 220px", background: "linear-gradient(135deg,#0f2557,#1d4ed8)", borderRadius: 10, padding: "14px 16px" }}>
+                  <div style={{ fontSize: 12, color: "#dbe6ff" }}>{t("قيمة المخزون الإجمالية", "Total stock value")}</div>
+                  <div style={{ fontSize: 22, fontWeight: 800, color: "#fff" }}>{fmt(totalValue)} {t("ر.س", "SAR")}</div>
+                </div>
+                <div style={{ flex: "1 1 220px", background: C.blueSoft, borderRadius: 10, padding: "14px 16px" }}>
+                  <div style={{ fontSize: 12, color: C.muted }}>{t("عدد الأصناف", "Number of items")}</div>
+                  <div style={{ fontSize: 22, fontWeight: 800, color: C.navy }}>{items.length}</div>
+                </div>
+                <div style={{ flex: "1 1 220px", background: lowStockItems.length > 0 ? "#fef2f2" : C.blueSoft, border: lowStockItems.length > 0 ? "1px solid #fecaca" : "none", borderRadius: 10, padding: "14px 16px" }}>
+                  <div style={{ fontSize: 12, color: lowStockItems.length > 0 ? C.danger : C.muted }}>{t("أصناف تحت الحد الأدنى", "Items below minimum")}</div>
+                  <div style={{ fontSize: 22, fontWeight: 800, color: lowStockItems.length > 0 ? C.danger : C.navy }}>{lowStockItems.length}</div>
+                </div>
+              </div>
+            </div>
+            <div style={cardStyle}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }} className="no-print">
+                <div style={cardTitle}>📋 {t("تفاصيل المخزون", "Stock details")}</div>
+                <button onClick={doPrint} style={ghostBtn}>🖨️ {t("طباعة", "Print")}</button>
+              </div>
+              <table>
+                <thead><tr><th style={th}>{t("الصنف", "Item")}</th><th style={th}>{t("الكود", "Code")}</th><th style={th}>{t("الرصيد", "Qty")}</th><th style={th}>{t("السعر", "Price")}</th><th style={th}>{t("القيمة", "Value")}</th></tr></thead>
+                <tbody>
+                  {items.map((it) => (
+                    <tr key={it.id} style={{ background: it.minStock > 0 && it.qty <= it.minStock ? "#fef2f2" : undefined }}>
+                      <td style={td}>{lang === "ar" ? (it.nameAr || it.nameEn) : (it.nameEn || it.nameAr)}</td>
+                      <td style={td}>{it.sku}</td>
+                      <td style={{ ...td, fontWeight: 700 }}>{fmt(it.qty)} {it.unit}</td>
+                      <td style={td}>{fmt(it.price)}</td>
+                      <td style={{ ...td, fontWeight: 700 }}>{fmt((it.qty || 0) * (it.price || 0))}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </>
+        ) : (
+          <div style={cardStyle}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }} className="no-print">
+              <div style={cardTitle}>🏬 {t("استهلاك كل فرع", "Consumption per branch")}</div>
+              <button onClick={doPrint} style={ghostBtn}>🖨️ {t("طباعة", "Print")}</button>
+            </div>
+            <table>
+              <thead><tr><th style={th}>{t("الفرع", "Branch")}</th><th style={th}>{t("إجمالي الكمية المسحوبة", "Total qty withdrawn")}</th><th style={th}>{t("القيمة الإجمالية", "Total value")}</th></tr></thead>
+              <tbody>
+                {byBranch.map((b) => (
+                  <tr key={b.branch}>
+                    <td style={{ ...td, fontWeight: 700 }}>{b.branch}</td>
+                    <td style={td}>{fmt(b.qtyTotal)}</td>
+                    <td style={{ ...td, fontWeight: 700 }}>{fmt(b.valueTotal)} {t("ر.س", "SAR")}</td>
+                  </tr>
+                ))}
+                {byBranch.length === 0 && <tr><td colSpan={3} style={{ ...td, textAlign: "center", color: "#9ca3af" }}>{t("لا يوجد حركات صرف في هذه الفترة", "No issue movements in this period")}</td></tr>}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+const TAB_DEFS_WH = [
+  { id: "in", labelAr: "وارد للمستودع", labelEn: "Stock In" },
+  { id: "out", labelAr: "صرف للفروع", labelEn: "Issue to Branch" },
+  { id: "items", labelAr: "الأصناف", labelEn: "Items" },
+  { id: "reports", labelAr: "التقارير", labelEn: "Reports" },
+];
+
+function App() {
+  const [users, setUsers] = useState(null);
+  const [meta, setMeta] = useState(null);
+  const [currentUser, setCurrentUser] = useState(null);
+  const [tab, setTab] = useState("in");
+  const [lang, setLang] = useState(localStorage.getItem("wh-lang") || "ar");
+
+  function t(ar, en) { return lang === "ar" ? ar : en; }
+
+  useEffect(() => {
+    const savedSession = localStorage.getItem("wh-session");
+    if (savedSession) { try { setCurrentUser(JSON.parse(savedSession)); } catch (e) {} }
+  }, []);
+
+  useEffect(() => {
+    const unsub = USERS_DOC.onSnapshot((doc) => {
+      setUsers(doc.exists ? (doc.data().list || []) : []);
+    });
+    return unsub;
+  }, []);
+  useEffect(() => {
+    const unsub = META_DOC.onSnapshot((doc) => {
+      setMeta(doc.exists ? doc.data() : { branches: [] });
+    });
+    return unsub;
+  }, []);
+
+  useEffect(() => {
+    document.documentElement.lang = lang;
+    document.documentElement.dir = lang === "ar" ? "rtl" : "ltr";
+    localStorage.setItem("wh-lang", lang);
+  }, [lang]);
+
+  function handleLogin(u) {
+    setCurrentUser(u);
+    localStorage.setItem("wh-session", JSON.stringify(u));
+  }
+  function handleLogout() {
+    setCurrentUser(null);
+    localStorage.removeItem("wh-session");
+  }
+
+  if (users === null || meta === null) {
+    return <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", color: C.muted }}>...</div>;
+  }
+  if (!currentUser) return <LoginScreen users={users} onLogin={handleLogin} />;
+
+  const visibleTabs = TAB_DEFS_WH.filter((tb) => {
+    if (tb.id === "items") return canManageWarehouse(currentUser.role);
+    if (tb.id === "in") return canManageWarehouse(currentUser.role);
+    return true; // out, reports متاحة لكل الأدوار
+  });
+
+  return (
+    <div style={{ minHeight: "100vh" }}>
+      <div style={{
+        background: "linear-gradient(90deg,#0f2557,#1d4ed8)", color: "#fff", padding: "14px 22px",
+        display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12,
+      }} className="no-print">
+        <div style={{ fontWeight: 800, fontSize: 15 }}>📦 {t("نظام إدارة المستودع", "Warehouse Management")}</div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          {visibleTabs.map((tb) => (
+            <button key={tb.id} onClick={() => setTab(tb.id)} style={{
+              padding: "8px 14px", borderRadius: 8, border: "none", cursor: "pointer", fontSize: 13, fontWeight: 700,
+              background: tab === tb.id ? "#fff" : "rgba(255,255,255,0.12)", color: tab === tb.id ? C.navy : "#fff",
+            }}>{lang === "ar" ? tb.labelAr : tb.labelEn}</button>
+          ))}
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 13 }}>
+          <a href="https://abbelroufmohamed-rgb.github.io/deera-fares-cash/" target="_blank" rel="noreferrer" title={t("نظام الكاشير والخزينة", "Cashier & Treasury System")} style={{
+            width: 34, height: 34, borderRadius: 8, background: "rgba(255,255,255,0.14)",
+            display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16,
+            textDecoration: "none", cursor: "pointer",
+          }}>💼</a>
+          <button onClick={() => setLang(lang === "ar" ? "en" : "ar")} style={{
+            background: "rgba(255,255,255,0.15)", color: "#fff", border: "none", borderRadius: 7, padding: "6px 12px", cursor: "pointer", fontWeight: 700,
+          }}>{lang === "ar" ? "EN" : "AR"}</button>
+          <span style={{ background: "rgba(255,255,255,0.12)", padding: "6px 12px", borderRadius: 20 }}>{currentUser.name} · {ROLE_LABELS[currentUser.role]}</span>
+          <button onClick={handleLogout} style={{ background: "#fff", color: C.danger, border: "none", borderRadius: 7, padding: "6px 12px", cursor: "pointer", fontWeight: 700 }}>
+            {t("خروج", "Logout")}
+          </button>
+        </div>
+      </div>
+
+      <div style={{ padding: 20, maxWidth: 1300, margin: "0 auto" }}>
+        {tab === "in" && canManageWarehouse(currentUser.role) && <StockInTab currentUser={currentUser} lang={lang} t={t} />}
+        {tab === "out" && <StockOutTab currentUser={currentUser} meta={meta} lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
+        {tab === "items" && canManageWarehouse(currentUser.role) && <ItemsTab currentUser={currentUser} lang={lang} t={t} />}
+        {tab === "reports" && <ReportsTab lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
