@@ -14,6 +14,7 @@
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@2.0.4/dist/qrcode.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 
 <style>
   * { box-sizing: border-box; }
@@ -78,7 +79,7 @@ const DEFAULT_INSTITUTION_NAME = "مؤسسة ديرة فارس للتجارة";
 
 /* Firestore collections — منفصلة تمامًا عن مجموعات تطبيق الكاشير، لكن بنفس المشروع */
 const USERS_DOC = db.collection("cashRecon").doc("users"); // نفس مستخدمي تطبيق الكاشير بالظبط
-const META_DOC = db.collection("cashRecon").doc("meta_default"); // نفس فروع تطبيق الكاشير
+const META_DOC = db.collection("institutionMeta").doc(DEFAULT_INSTITUTION_ID); // نفس فروع تطبيق الكاشير بالظبط (نفس مكان الحفظ الحقيقي)
 const ITEMS_COL = db.collection("whItems");
 const MOVES_COL = db.collection("whMoves");
 const REQUESTS_COL = db.collection("whRequests");
@@ -204,6 +205,10 @@ function ItemsTab({ currentUser, lang, t, whMeta }) {
   const [msg, setMsg] = useState("");
   const [showScanner, setShowScanner] = useState(false);
   const [qrItem, setQrItem] = useState(null);
+  const [importing, setImporting] = useState(false);
+  const [importErrors, setImportErrors] = useState([]);
+  const [importSummary, setImportSummary] = useState("");
+  const fileInputRef = useRef(null);
 
   function emptyItem() { return { nameAr: "", nameEn: "", sku: "", unit: "قطعة", price: "", minStock: "", category: "", qty: 0 }; }
 
@@ -215,6 +220,88 @@ function ItemsTab({ currentUser, lang, t, whMeta }) {
   }, []);
 
   function set(key, val) { setForm((f) => ({ ...f, [key]: val })); }
+
+  // أعمدة ملف Excel (نفس الترتيب للتصدير والاستيراد)
+  const EXPORT_HEADERS = [
+    { key: "nameAr", labelAr: "اسم الصنف (عربي)", labelEn: "Item name (Arabic)" },
+    { key: "nameEn", labelAr: "اسم الصنف (إنجليزي)", labelEn: "Item name (English)" },
+    { key: "sku", labelAr: "الكود", labelEn: "Code" },
+    { key: "unit", labelAr: "وحدة القياس", labelEn: "Unit" },
+    { key: "price", labelAr: "السعر", labelEn: "Price" },
+    { key: "minStock", labelAr: "الحد الأدنى", labelEn: "Min stock" },
+    { key: "category", labelAr: "الفئة", labelEn: "Category" },
+    { key: "qty", labelAr: "الرصيد الحالي (للعرض فقط، متغيّرش)", labelEn: "Current qty (read-only, don't edit)" },
+  ];
+
+  function exportExcel() {
+    const headerRow = EXPORT_HEADERS.map((h) => lang === "ar" ? h.labelAr : h.labelEn);
+    const rows = (items || []).map((it) => EXPORT_HEADERS.map((h) => it[h.key] ?? ""));
+    const ws = window.XLSX.utils.aoa_to_sheet([headerRow, ...rows]);
+    const wb = window.XLSX.utils.book_new();
+    window.XLSX.utils.book_append_sheet(wb, ws, "Items");
+    window.XLSX.writeFile(wb, "warehouse-items.xlsx");
+  }
+  function downloadTemplate() {
+    const headerRow = EXPORT_HEADERS.filter((h) => h.key !== "qty").map((h) => lang === "ar" ? h.labelAr : h.labelEn);
+    const ws = window.XLSX.utils.aoa_to_sheet([headerRow]);
+    const wb = window.XLSX.utils.book_new();
+    window.XLSX.utils.book_append_sheet(wb, ws, "Template");
+    window.XLSX.writeFile(wb, "warehouse-items-template.xlsx");
+  }
+
+  function buildErrorMailto(errors) {
+    if (!currentUser.email) return null;
+    const subject = t(`أخطاء استيراد أصناف المستودع (${errors.length})`, `Warehouse items import errors (${errors.length})`);
+    const body = errors.map((e) => `${t("صف", "Row")} ${e.row}: ${e.reason}`).join("\n");
+    return "mailto:" + currentUser.email + "?subject=" + encodeURIComponent(subject) + "&body=" + encodeURIComponent(body);
+  }
+
+  async function importExcel(file) {
+    setImporting(true); setImportErrors([]); setImportSummary("");
+    try {
+      const buf = await file.arrayBuffer();
+      const wb = window.XLSX.read(buf, { type: "array" });
+      const sheet = wb.Sheets[wb.SheetNames[0]];
+      const rows = window.XLSX.utils.sheet_to_json(sheet, { header: 1, blankrows: false });
+      const dataRows = rows.slice(1); // تجاهل صف العناوين
+
+      let added = 0, updated = 0;
+      const errors = [];
+      for (let i = 0; i < dataRows.length; i++) {
+        const r = dataRows[i];
+        const rowNum = i + 2; // رقم الصف الحقيقي في الملف (1 = العناوين)
+        const nameAr = String(r[0] || "").trim();
+        const nameEn = String(r[1] || "").trim();
+        const sku = String(r[2] || "").trim();
+        const unit = String(r[3] || "").trim() || "قطعة";
+        const price = Number(r[4]) || 0;
+        const minStock = Number(r[5]) || 0;
+        const category = String(r[6] || "").trim();
+
+        if (!nameAr && !nameEn) { errors.push({ row: rowNum, reason: t("الصف فاضي من اسم الصنف (عربي أو إنجليزي)", "Row is missing item name (Arabic or English)") }); continue; }
+        try {
+          const existing = sku ? (items || []).find((it) => it.sku === sku) : null;
+          if (existing) {
+            await ITEMS_COL.doc(existing.id).update({ nameAr, nameEn, unit, price, minStock, category });
+            updated++;
+          } else {
+            await ITEMS_COL.add({
+              nameAr, nameEn, sku: sku || uid().toUpperCase(), unit, price, minStock, category,
+              qty: 0, institutionId: DEFAULT_INSTITUTION_ID, createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+            });
+            added++;
+          }
+        } catch (e) {
+          errors.push({ row: rowNum, reason: e.message });
+        }
+      }
+      setImportErrors(errors);
+      setImportSummary(t(`تم الاستيراد: ${added} صنف جديد، ${updated} صنف اتحدّث` + (errors.length ? `، ${errors.length} صف فيه خطأ` : ""), `Import done: ${added} new, ${updated} updated` + (errors.length ? `, ${errors.length} row(s) with errors` : "")));
+    } catch (e) {
+      setImportErrors([{ row: "—", reason: t("تعذر قراءة الملف: ", "Could not read file: ") + e.message }]);
+    }
+    setImporting(false);
+  }
 
   async function save() {
     if (!form.nameAr.trim() && !form.nameEn.trim()) { setMsg(t("اكتب اسم الصنف بالعربي أو الإنجليزي", "Enter the item name in Arabic or English")); return; }
@@ -304,6 +391,41 @@ function ItemsTab({ currentUser, lang, t, whMeta }) {
           {editingId && <button onClick={() => { setForm(emptyItem()); setEditingId(null); }} style={ghostBtn}>{t("إلغاء", "Cancel")}</button>}
           {msg && <span style={{ fontSize: 13, color: msg.startsWith("✅") ? C.success : C.danger }}>{msg}</span>}
         </div>
+      </div>
+
+      <div style={cardStyle}>
+        <div style={cardTitle}>📊 {t("تصدير واستيراد الأصناف عبر Excel", "Export/Import items via Excel")}</div>
+        <div style={{ fontSize: 12.5, color: C.muted, marginBottom: 14 }}>
+          {t("حمّل نموذج فاضي، عبّيه بالأصناف اللي تحبها، وارفعه تاني — أي كود موجود مسبقًا هيتحدّث، وأي كود جديد هيتضاف كصنف جديد.", "Download an empty template, fill it in, then upload it back — existing codes update, new codes get added as new items.")}
+        </div>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+          <button onClick={downloadTemplate} style={ghostBtn}>📄 {t("تحميل نموذج فاضي", "Download empty template")}</button>
+          <button onClick={exportExcel} style={ghostBtn}>⬇️ {t("تصدير كل الأصناف الحالية", "Export all current items")}</button>
+          <input type="file" accept=".xlsx,.xls" ref={fileInputRef} style={{ display: "none" }}
+            onChange={(e) => { if (e.target.files[0]) importExcel(e.target.files[0]); e.target.value = ""; }} />
+          <button onClick={() => fileInputRef.current?.click()} disabled={importing} style={smallBtn}>
+            {importing ? t("جارِ الاستيراد...", "Importing...") : "⬆️ " + t("رفع ملف Excel معبّى", "Upload filled Excel file")}
+          </button>
+        </div>
+        {importSummary && <div style={{ marginTop: 12, fontSize: 13.5, fontWeight: 700, color: importErrors.length ? C.warn : C.success }}>{importSummary}</div>}
+        {importErrors.length > 0 && (
+          <div style={{ marginTop: 10, background: "#fef2f2", border: "1px solid #fecaca", borderRadius: 10, padding: "12px 14px" }}>
+            <div style={{ fontWeight: 700, color: C.danger, marginBottom: 8, fontSize: 13 }}>⚠️ {t("أخطاء أثناء الاستيراد", "Errors during import")}:</div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 10 }}>
+              {importErrors.map((e, i) => (
+                <div key={i} style={{ fontSize: 12.5, color: "#991b1b" }}>{t("صف", "Row")} {e.row}: {e.reason}</div>
+              ))}
+            </div>
+            {currentUser.email ? (
+              <a href={buildErrorMailto(importErrors)} style={{
+                display: "inline-flex", alignItems: "center", gap: 6, background: C.blue, color: "#fff",
+                borderRadius: 20, padding: "6px 14px", fontSize: 12.5, fontWeight: 700, textDecoration: "none",
+              }}>📧 {t("راسلني بتفاصيل الأخطاء دي", "Email me these error details")}</a>
+            ) : (
+              <div style={{ fontSize: 11.5, color: C.muted }}>{t("ملاحظة: أضف إيميلك في نظام الكاشير (إدارة المستخدمين) عشان يظهر زرار المراسلة هنا.", "Note: add your email in the cashier system (user management) to enable the email button here.")}</div>
+            )}
+          </div>
+        )}
       </div>
 
       <div style={cardStyle}>
