@@ -832,17 +832,24 @@ function ItemPicker({ items, lang, t, onPick, selectedItem }) {
 function StockInTab({ currentUser, lang, t }) {
   const [items, setItems] = useState([]);
   const [suppliers, setSuppliers] = useState([]);
-  const [selectedItem, setSelectedItem] = useState(null);
-  const [qty, setQty] = useState("");
-  const [unitCost, setUnitCost] = useState("");
+  const [recent, setRecent] = useState([]);
+  const [msg, setMsg] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  // بيانات الفاتورة (تتكتب مرة واحدة لكل الأصناف)
   const [supplierName, setSupplierName] = useState("");
   const [taxNumber, setTaxNumber] = useState("");
   const [invoiceNo, setInvoiceNo] = useState("");
+  const [invoiceDate, setInvoiceDate] = useState(todayStr());
+
+  // سطر الصنف الحالي قبل ما يضاف للفاتورة
+  const [selectedItem, setSelectedItem] = useState(null);
+  const [qty, setQty] = useState("");
+  const [unitCost, setUnitCost] = useState("");
   const [expiryDate, setExpiryDate] = useState("");
-  const [note, setNote] = useState("");
-  const [saving, setSaving] = useState(false);
-  const [msg, setMsg] = useState("");
-  const [recent, setRecent] = useState([]);
+
+  // كل الأصناف اللي اتضافت للفاتورة الحالية
+  const [lines, setLines] = useState([]);
 
   useEffect(() => {
     const unsub = ITEMS_COL.orderBy("nameAr").onSnapshot((snap) => setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
@@ -872,42 +879,56 @@ function StockInTab({ currentUser, lang, t }) {
     if (found) setTaxNumber(found.taxNumber || "");
   }
 
-  async function submit() {
+  function addLine() {
     const q = Number(qty);
-    const cost = Number(unitCost) || 0;
     if (!selectedItem) { setMsg(t("اختر الصنف أولًا", "Choose an item first")); return; }
     if (!q || q <= 0) { setMsg(t("أدخل كمية صحيحة أكبر من صفر", "Enter a quantity greater than zero")); return; }
+    setLines((ls) => [...ls, {
+      key: uid(), itemId: selectedItem.id, itemName: selectedItem.nameAr, itemNameEn: selectedItem.nameEn, unit: selectedItem.unit,
+      qty: q, unitCost: Number(unitCost) || 0, expiryDate,
+    }]);
+    setSelectedItem(null); setQty(""); setUnitCost(""); setExpiryDate(""); setMsg("");
+  }
+  function removeLine(key) { setLines((ls) => ls.filter((l) => l.key !== key)); }
+
+  const linesTotal = lines.reduce((s, l) => s + l.qty * l.unitCost, 0);
+  const linesVat = linesTotal * 0.15;
+
+  async function submitInvoice() {
+    if (lines.length === 0) { setMsg(t("ضيف صنف واحد على الأقل للفاتورة قبل الحفظ", "Add at least one item to the invoice before saving")); return; }
     setSaving(true); setMsg("");
     try {
       if (supplierName.trim()) {
         const exists = suppliers.find((s) => s.name === supplierName.trim());
         if (!exists) await SUPPLIERS_COL.add({ name: supplierName.trim(), taxNumber: taxNumber.trim(), institutionId: DEFAULT_INSTITUTION_ID, createdAt: firebase.firestore.FieldValue.serverTimestamp() });
       }
-      const purchaseValue = q * cost;
-      const vatAmount = purchaseValue * 0.15;
-      await db.runTransaction(async (tx) => {
-        const ref = ITEMS_COL.doc(selectedItem.id);
-        const snap = await tx.get(ref);
-        const curQty = Number(snap.data().qty) || 0;
-        tx.update(ref, { qty: curQty + q });
-        tx.set(MOVES_COL.doc(), {
-          itemId: selectedItem.id, itemName: selectedItem.nameAr, itemNameEn: selectedItem.nameEn, unit: selectedItem.unit,
-          type: "in", qty: q, unitCost: cost, purchaseValue, vatAmount, date: todayStr(),
-          supplierName: supplierName.trim(), taxNumber: taxNumber.trim(), invoiceNo: invoiceNo.trim(),
-          paymentStatus: "unpaid", paidAmount: 0,
-          note: note.trim(), enteredBy: currentUser.name, institutionId: DEFAULT_INSTITUTION_ID,
-          createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+      for (const line of lines) {
+        const purchaseValue = line.qty * line.unitCost;
+        const vatAmount = purchaseValue * 0.15;
+        await db.runTransaction(async (tx) => {
+          const ref = ITEMS_COL.doc(line.itemId);
+          const snap = await tx.get(ref);
+          const curQty = Number(snap.data().qty) || 0;
+          tx.update(ref, { qty: curQty + line.qty });
+          tx.set(MOVES_COL.doc(), {
+            itemId: line.itemId, itemName: line.itemName, itemNameEn: line.itemNameEn, unit: line.unit,
+            type: "in", qty: line.qty, unitCost: line.unitCost, purchaseValue, vatAmount, date: invoiceDate,
+            supplierName: supplierName.trim(), taxNumber: taxNumber.trim(), invoiceNo: invoiceNo.trim(),
+            paymentStatus: "unpaid", paidAmount: 0,
+            enteredBy: currentUser.name, institutionId: DEFAULT_INSTITUTION_ID,
+            createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+          });
         });
-      });
-      if (expiryDate) {
-        await BATCHES_COL.add({
-          itemId: selectedItem.id, itemName: selectedItem.nameAr, itemNameEn: selectedItem.nameEn, unit: selectedItem.unit,
-          qty: q, remainingQty: q, expiryDate, receivedDate: todayStr(), invoiceNo: invoiceNo.trim(),
-          institutionId: DEFAULT_INSTITUTION_ID, createdAt: firebase.firestore.FieldValue.serverTimestamp(),
-        });
+        if (line.expiryDate) {
+          await BATCHES_COL.add({
+            itemId: line.itemId, itemName: line.itemName, itemNameEn: line.itemNameEn, unit: line.unit,
+            qty: line.qty, remainingQty: line.qty, expiryDate: line.expiryDate, receivedDate: invoiceDate, invoiceNo: invoiceNo.trim(),
+            institutionId: DEFAULT_INSTITUTION_ID, createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+          });
+        }
       }
-      setMsg("✅ " + t(`تم إضافة ${fmt(q)} ${selectedItem.unit} للمخزون`, `Added ${fmt(q)} ${selectedItem.unit} to stock`));
-      setSelectedItem(null); setQty(""); setUnitCost(""); setSupplierName(""); setTaxNumber(""); setInvoiceNo(""); setExpiryDate(""); setNote("");
+      setMsg("✅ " + t(`تم حفظ الفاتورة بنجاح (${lines.length} صنف) وإضافتهم للمخزون`, `Invoice saved successfully (${lines.length} item(s)) and added to stock`));
+      setLines([]); setSupplierName(""); setTaxNumber(""); setInvoiceNo(""); setInvoiceDate(todayStr());
     } catch (e) { setMsg("Error: " + e.message); }
     setSaving(false);
   }
@@ -915,21 +936,10 @@ function StockInTab({ currentUser, lang, t }) {
   return (
     <div>
       <div style={cardStyle}>
-        <div style={cardTitle}>📥 {t("وارد للمستودع (استلام بضاعة)", "Stock In (Goods Receipt)")}</div>
-        <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-end" }}>
-          <div style={{ flex: "1 1 260px" }}>
-            <ItemPicker items={items} lang={lang} t={t} onPick={setSelectedItem} selectedItem={selectedItem} />
-          </div>
-          <div style={{ flex: "1 1 110px" }}>
-            <label style={smallLabel}>{t("الكمية", "Quantity")} {selectedItem && `(${selectedItem.unit})`}</label>
-            <input type="number" step="0.01" value={qty} onChange={(e) => setQty(e.target.value)} style={inputStyle2} />
-          </div>
-          <div style={{ flex: "1 1 130px" }}>
-            <label style={smallLabel}>{t("تكلفة الوحدة", "Unit cost")}</label>
-            <input type="number" step="0.01" value={unitCost} onChange={(e) => setUnitCost(e.target.value)} style={inputStyle2} />
-          </div>
-        </div>
-        <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-end", marginTop: 12 }}>
+        <div style={cardTitle}>📥 {t("وارد للمستودع (فاتورة بعدة أصناف)", "Stock In (Multi-Item Invoice)")}</div>
+        <div style={{ fontSize: 12.5, color: C.muted, marginBottom: 14 }}>{t("اكتب بيانات الفاتورة مرة واحدة، وضيف كل الأصناف اللي فيها واحد ورا التاني، وبعدين احفظ الفاتورة كلها مرة واحدة.", "Enter the invoice details once, add every item in it one after another, then save the whole invoice at once.")}</div>
+
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 16, paddingBottom: 16, borderBottom: "1px dashed " + C.border }}>
           <div style={{ flex: "1 1 180px", position: "relative" }}>
             <label style={smallLabel}>{t("اسم المورد", "Supplier name")}</label>
             <input value={supplierName} onChange={(e) => onSupplierNameChange(e.target.value)} style={inputStyle2} list="wh-suppliers-list" />
@@ -945,22 +955,61 @@ function StockInTab({ currentUser, lang, t }) {
             <label style={smallLabel}>{t("رقم الفاتورة", "Invoice number")}</label>
             <input value={invoiceNo} onChange={(e) => setInvoiceNo(e.target.value)} style={inputStyle2} />
           </div>
-          <div style={{ flex: "1 1 150px" }}>
-            <label style={smallLabel}>📅 {t("تاريخ الصلاحية (اختياري)", "Expiry date (optional)")}</label>
+          <div style={{ flex: "1 1 140px" }}>
+            <label style={smallLabel}>{t("تاريخ الفاتورة", "Invoice date")}</label>
+            <input type="date" value={invoiceDate} onChange={(e) => setInvoiceDate(e.target.value)} style={inputStyle2} />
+          </div>
+        </div>
+
+        <div style={{ fontWeight: 700, fontSize: 13.5, color: C.navy, marginBottom: 10 }}>➕ {t("أضف صنف للفاتورة", "Add item to invoice")}</div>
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-end" }}>
+          <div style={{ flex: "1 1 240px" }}>
+            <ItemPicker items={items} lang={lang} t={t} onPick={setSelectedItem} selectedItem={selectedItem} />
+          </div>
+          <div style={{ flex: "1 1 110px" }}>
+            <label style={smallLabel}>{t("الكمية", "Quantity")} {selectedItem && `(${selectedItem.unit})`}</label>
+            <input type="number" step="0.01" value={qty} onChange={(e) => setQty(e.target.value)} style={inputStyle2} />
+          </div>
+          <div style={{ flex: "1 1 120px" }}>
+            <label style={smallLabel}>{t("تكلفة الوحدة", "Unit cost")}</label>
+            <input type="number" step="0.01" value={unitCost} onChange={(e) => setUnitCost(e.target.value)} style={inputStyle2} />
+          </div>
+          <div style={{ flex: "1 1 140px" }}>
+            <label style={smallLabel}>📅 {t("الصلاحية (اختياري)", "Expiry (optional)")}</label>
             <input type="date" value={expiryDate} onChange={(e) => setExpiryDate(e.target.value)} style={inputStyle2} />
           </div>
-          <div style={{ flex: "1 1 180px" }}>
-            <label style={smallLabel}>{t("ملاحظة (اختياري)", "Note (optional)")}</label>
-            <input value={note} onChange={(e) => setNote(e.target.value)} style={inputStyle2} />
-          </div>
-          <button onClick={submit} disabled={saving} style={smallBtn}>{saving ? t("جارِ الحفظ...", "Saving...") : "💾 " + t("تسجيل الوارد", "Record receipt")}</button>
+          <button onClick={addLine} style={ghostBtn}>➕ {t("أضف للفاتورة", "Add to invoice")}</button>
         </div>
-        {qty && unitCost && (
-          <div style={{ marginTop: 10, fontSize: 12.5, color: C.muted }}>
-            {t("قيمة الفاتورة (قبل الضريبة):", "Invoice value (before VAT):")} {fmt(Number(qty) * Number(unitCost))} — {t("الضريبة 15%:", "15% VAT:")} {fmt(Number(qty) * Number(unitCost) * 0.15)} — {t("الإجمالي:", "Total:")} {fmt(Number(qty) * Number(unitCost) * 1.15)}
+        {msg && <div style={{ marginTop: 10, fontSize: 13.5, color: msg.startsWith("✅") ? C.success : C.danger }}>{msg}</div>}
+
+        {lines.length > 0 && (
+          <div style={{ marginTop: 18 }}>
+            <div style={{ fontWeight: 700, fontSize: 13.5, color: C.navy, marginBottom: 10 }}>🧾 {t("أصناف هذه الفاتورة", "Items in this invoice")} ({lines.length})</div>
+            <div style={{ overflowX: "auto" }}>
+              <table>
+                <thead><tr><th style={th}>{t("الصنف", "Item")}</th><th style={th}>{t("الكمية", "Qty")}</th><th style={th}>{t("تكلفة الوحدة", "Unit cost")}</th><th style={th}>{t("القيمة", "Value")}</th><th style={th}>{t("الصلاحية", "Expiry")}</th><th style={th}></th></tr></thead>
+                <tbody>
+                  {lines.map((l) => (
+                    <tr key={l.key}>
+                      <td style={{ ...td, fontWeight: 700 }}>{lang === "ar" ? l.itemName : (l.itemNameEn || l.itemName)}</td>
+                      <td style={td}>{fmt(l.qty)} {l.unit}</td>
+                      <td style={td}>{fmt(l.unitCost)}</td>
+                      <td style={{ ...td, fontWeight: 700 }}>{fmt(l.qty * l.unitCost)}</td>
+                      <td style={td}>{l.expiryDate || "—"}</td>
+                      <td style={td}><span onClick={() => removeLine(l.key)} style={{ cursor: "pointer", color: C.danger, fontWeight: 700 }}>{t("حذف", "Remove")}</span></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div style={{ marginTop: 12, fontSize: 13, color: C.muted }}>
+              {t("قيمة الفاتورة (قبل الضريبة):", "Invoice value (before VAT):")} <b>{fmt(linesTotal)}</b> — {t("الضريبة 15%:", "15% VAT:")} <b>{fmt(linesVat)}</b> — {t("الإجمالي:", "Total:")} <b>{fmt(linesTotal + linesVat)}</b>
+            </div>
+            <button onClick={submitInvoice} disabled={saving} style={{ ...smallBtn, marginTop: 14, padding: "12px 26px", fontSize: 15 }}>
+              {saving ? t("جارِ الحفظ...", "Saving...") : "💾 " + t(`حفظ الفاتورة كاملة (${lines.length} صنف)`, `Save full invoice (${lines.length} item(s))`)}
+            </button>
           </div>
         )}
-        {msg && <div style={{ marginTop: 10, fontSize: 13.5, color: msg.startsWith("✅") ? C.success : C.danger }}>{msg}</div>}
       </div>
 
       <div style={cardStyle}>
