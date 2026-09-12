@@ -88,6 +88,7 @@ const WH_META_DOC = db.collection("whMeta").doc("default");
 const BRANCH_STOCK_COL = db.collection("whBranchStock"); // مخزون كل فرع لكل صنف: doc id = branch__itemId
 const WH_NOTIF_COL = db.collection("whNotifications");
 const SUPPLIERS_COL = db.collection("whSuppliers");
+const BATCHES_COL = db.collection("whBatches"); // دفعات الوارد بتواريخ صلاحيتها
 
 const ROLE_LABELS = {
   admin: "أدمن", financial_manager: "مدير مالي", accountant: "محاسب",
@@ -540,6 +541,160 @@ function WarehouseSettingsTab({ meta, whMeta, t }) {
         </div>
         {msg && <div style={{ marginTop: 10, fontSize: 13, color: msg.startsWith("✅") ? C.success : C.danger }}>{msg}</div>}
       </div>
+
+      <WarehouseBackupCard t={t} />
+    </div>
+  );
+}
+
+/* ============ نسخة احتياطية شاملة: تصدير كل بيانات المستودع (أصناف، حركات، موردين، مخزون فروع، جرد، إشعارات) في ملف Excel واحد ============ */
+/* ============ قائمة شراء مقترحة تلقائيًا: أصناف قريبة من النفاذ بناءً على معدل الاستهلاك الفعلي، قابلة للتصدير كأمر شراء ============ */
+function SuggestedPurchaseTab({ lang, t, institutionName }) {
+  const [items, setItems] = useState([]);
+  const [moves, setMoves] = useState([]);
+  const [daysWindow, setDaysWindow] = useState(30); // نافذة تحليل الاستهلاك
+
+  useEffect(() => {
+    const unsub = ITEMS_COL.orderBy("nameAr").onSnapshot((snap) => setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
+    return unsub;
+  }, []);
+  useEffect(() => {
+    const unsub = MOVES_COL.orderBy("createdAt", "desc").limit(3000).onSnapshot((snap) => setMoves(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
+    return unsub;
+  }, []);
+
+  const suggestions = useMemo(() => {
+    const fromDate = new Date(Date.now() - daysWindow * 86400000).toISOString().slice(0, 10);
+    const consumedByItem = {};
+    const lastSupplierByItem = {};
+    moves.forEach((m) => {
+      if (m.type === "out" && m.date >= fromDate) consumedByItem[m.itemId] = (consumedByItem[m.itemId] || 0) + (Number(m.qty) || 0);
+      if (m.type === "in" && m.supplierName && !lastSupplierByItem[m.itemId]) lastSupplierByItem[m.itemId] = m.supplierName;
+    });
+    return items.map((it) => {
+      const consumed = consumedByItem[it.id] || 0;
+      const dailyRate = consumed / daysWindow;
+      const currentQty = Number(it.qty) || 0;
+      const daysLeft = dailyRate > 0 ? currentQty / dailyRate : Infinity;
+      const needsReorder = (it.minStock > 0 && currentQty <= it.minStock) || (dailyRate > 0 && daysLeft <= 14);
+      // كمية مقترحة: تغطية 30 يوم قادمة، مطروح منها المتاح حاليًا
+      const suggestedQty = Math.max(0, Math.ceil(dailyRate * 30 - currentQty));
+      return { ...it, dailyRate, daysLeft, needsReorder, suggestedQty, lastSupplier: lastSupplierByItem[it.id] || "" };
+    }).filter((it) => it.needsReorder).sort((a, b) => a.daysLeft - b.daysLeft);
+    // eslint-disable-next-line
+  }, [items, moves, daysWindow]);
+
+  function exportOrder() {
+    const headerRow = [t("الصنف", "Item"), t("الرصيد الحالي", "Current qty"), t("الكمية المقترحة", "Suggested qty"), t("آخر مورد", "Last supplier"), t("السعر التقديري", "Estimated price"), t("القيمة التقديرية", "Estimated value")];
+    const rows = suggestions.map((s) => [
+      lang === "ar" ? (s.nameAr || s.nameEn) : (s.nameEn || s.nameAr), s.qty, s.suggestedQty, s.lastSupplier, s.price, s.suggestedQty * (s.price || 0),
+    ]);
+    const ws = window.XLSX.utils.aoa_to_sheet([headerRow, ...rows]);
+    const wb = window.XLSX.utils.book_new();
+    window.XLSX.utils.book_append_sheet(wb, ws, "PurchaseOrder");
+    window.XLSX.writeFile(wb, `suggested-purchase-order-${todayStr()}.xlsx`);
+  }
+
+  const totalEstimated = suggestions.reduce((s, x) => s + x.suggestedQty * (x.price || 0), 0);
+
+  return (
+    <div>
+      <div style={cardStyle}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 4 }}>
+          <div style={{ ...cardTitle, marginBottom: 0, border: "none", padding: 0 }}>🛍️ {t("قائمة شراء مقترحة تلقائيًا", "Auto-Suggested Purchase List")}</div>
+          {suggestions.length > 0 && <button onClick={exportOrder} style={smallBtn}>⬇️ {t("تصدير كأمر شراء", "Export as purchase order")}</button>}
+        </div>
+        <div style={{ fontSize: 12.5, color: C.muted, marginBottom: 14 }}>{t("بناءً على معدل استهلاك كل صنف فعليًا خلال الفترة، والكمية المقترحة بتغطي 30 يوم قادمة.", "Based on each item's actual consumption rate over the period; suggested quantity covers the next 30 days.")}</div>
+        <div style={{ marginBottom: 14 }}>
+          <label style={smallLabel}>{t("نافذة تحليل الاستهلاك (أيام)", "Consumption analysis window (days)")}</label>
+          <select value={daysWindow} onChange={(e) => setDaysWindow(Number(e.target.value))} style={{ ...inputStyle2, maxWidth: 160 }}>
+            <option value={7}>7</option><option value={14}>14</option><option value={30}>30</option><option value={60}>60</option>
+          </select>
+        </div>
+        {suggestions.length > 0 && (
+          <div style={{ background: "linear-gradient(135deg,#0f2557,#1d4ed8)", borderRadius: 10, padding: "12px 16px", marginBottom: 14, display: "inline-block" }}>
+            <div style={{ fontSize: 12, color: "#dbe6ff" }}>{t("القيمة التقديرية الإجمالية للطلب", "Total estimated order value")}</div>
+            <div style={{ fontSize: 20, fontWeight: 800, color: "#fff" }}>{fmt(totalEstimated)} {t("ر.س", "SAR")}</div>
+          </div>
+        )}
+        <div style={{ overflowX: "auto" }}>
+          <table>
+            <thead><tr><th style={th}>{t("الصنف", "Item")}</th><th style={th}>{t("الرصيد الحالي", "Current qty")}</th><th style={th}>{t("معدل الاستهلاك اليومي", "Daily rate")}</th><th style={th}>{t("أيام متبقية تقريبًا", "Days left (approx)")}</th><th style={th}>{t("الكمية المقترحة", "Suggested qty")}</th><th style={th}>{t("آخر مورد", "Last supplier")}</th></tr></thead>
+            <tbody>
+              {suggestions.map((s) => (
+                <tr key={s.id} style={{ background: s.daysLeft <= 3 ? "#fef2f2" : undefined }}>
+                  <td style={{ ...td, fontWeight: 700 }}>{lang === "ar" ? (s.nameAr || s.nameEn) : (s.nameEn || s.nameAr)}</td>
+                  <td style={td}>{fmt(s.qty)} {s.unit}</td>
+                  <td style={td}>{s.dailyRate > 0 ? fmt(s.dailyRate) : "—"}</td>
+                  <td style={{ ...td, fontWeight: 700, color: s.daysLeft <= 3 ? C.danger : s.daysLeft <= 14 ? C.warn : C.muted }}>{s.daysLeft === Infinity ? "—" : Math.round(s.daysLeft)}</td>
+                  <td style={{ ...td, fontWeight: 700, color: C.navy }}>{fmt(s.suggestedQty)} {s.unit}</td>
+                  <td style={td}>{s.lastSupplier || "—"}</td>
+                </tr>
+              ))}
+              {suggestions.length === 0 && <tr><td colSpan={6} style={{ ...td, textAlign: "center", color: "#9ca3af" }}>{t("لا يوجد أصناف محتاجة إعادة طلب حاليًا 🎉", "No items currently need reordering 🎉")}</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function WarehouseBackupCard({ t }) {
+  const [working, setWorking] = useState(false);
+  const [msg, setMsg] = useState("");
+
+  async function downloadBackup() {
+    setWorking(true); setMsg("");
+    try {
+      const [itemsSnap, movesSnap, suppliersSnap, branchStockSnap, countsSnap, notifsSnap] = await Promise.all([
+        ITEMS_COL.get(), MOVES_COL.get(), SUPPLIERS_COL.get(), BRANCH_STOCK_COL.get(), COUNTS_COL.get(), WH_NOTIF_COL.get(),
+      ]);
+
+      function toRows(snap) {
+        return snap.docs.map((d) => {
+          const data = d.data();
+          const row = { id: d.id };
+          Object.keys(data).forEach((k) => {
+            const v = data[k];
+            row[k] = (v && typeof v === "object" && v.toDate) ? v.toDate().toISOString() : (typeof v === "object" ? JSON.stringify(v) : v);
+          });
+          return row;
+        });
+      }
+
+      const wb = window.XLSX.utils.book_new();
+      const sheets = [
+        { name: "Items", rows: toRows(itemsSnap) },
+        { name: "Moves", rows: toRows(movesSnap) },
+        { name: "Suppliers", rows: toRows(suppliersSnap) },
+        { name: "BranchStock", rows: toRows(branchStockSnap) },
+        { name: "Counts", rows: toRows(countsSnap) },
+        { name: "Notifications", rows: toRows(notifsSnap) },
+      ];
+      sheets.forEach((s) => {
+        const ws = s.rows.length > 0 ? window.XLSX.utils.json_to_sheet(s.rows) : window.XLSX.utils.aoa_to_sheet([["لا يوجد بيانات"]]);
+        window.XLSX.utils.book_append_sheet(wb, ws, s.name);
+      });
+      const stamp = todayStr();
+      window.XLSX.writeFile(wb, `warehouse-backup-${stamp}.xlsx`);
+      setMsg("✅ " + t("تم تحميل النسخة الاحتياطية بنجاح — احتفظ بالملف في مكان آمن", "Backup downloaded successfully — keep the file somewhere safe"));
+    } catch (e) {
+      setMsg("Error: " + e.message);
+    }
+    setWorking(false);
+  }
+
+  return (
+    <div style={cardStyle}>
+      <div style={cardTitle}>💾 {t("نسخة احتياطية شاملة", "Full Backup")}</div>
+      <div style={{ fontSize: 12.5, color: C.muted, marginBottom: 14 }}>
+        {t("بضغطة واحدة، هتنزّل ملف Excel فيه كل بيانات المستودع (الأصناف، كل حركات الوارد والصادر، الموردين، مخزون الفروع، سجل الجرد، والإشعارات) — احتفظ بيه على جهازك بشكل دوري.", "One click downloads an Excel file with all warehouse data (items, all in/out moves, suppliers, branch stock, count history, and notifications) — keep it on your device periodically.")}
+      </div>
+      <button onClick={downloadBackup} disabled={working} style={smallBtn}>
+        {working ? t("جارِ التحضير...", "Preparing...") : "⬇️ " + t("تحميل نسخة احتياطية الآن", "Download backup now")}
+      </button>
+      {msg && <div style={{ marginTop: 10, fontSize: 13, color: msg.startsWith("✅") ? C.success : C.danger }}>{msg}</div>}
     </div>
   );
 }
@@ -557,6 +712,75 @@ function ItemLabelModal({ item, lang, t, onClose }) {
         <div style={{ display: "flex", gap: 10, justifyContent: "center", marginTop: 16 }} className="no-print">
           <button onClick={() => window.print()} style={smallBtn}>🖨️ {t("طباعة", "Print")}</button>
           <button onClick={onClose} style={ghostBtn}>{t("إغلاق", "Close")}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============ طباعة ملصقات بالجملة: تحديد كذا صنف وطباعتهم كلهم في ورقة واحدة مرتّبة ============ */
+function BulkLabelsTab({ lang, t }) {
+  const [items, setItems] = useState([]);
+  const [selected, setSelected] = useState({});
+  const [showPrint, setShowPrint] = useState(false);
+
+  useEffect(() => {
+    const unsub = ITEMS_COL.orderBy("nameAr").onSnapshot((snap) => setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
+    return unsub;
+  }, []);
+
+  function toggle(id) { setSelected((s) => ({ ...s, [id]: !s[id] })); }
+  function selectAll() { const all = {}; items.forEach((it) => (all[it.id] = true)); setSelected(all); }
+  function clearAll() { setSelected({}); }
+
+  const selectedItems = items.filter((it) => selected[it.id]);
+
+  if (showPrint) {
+    return (
+      <div>
+        <div className="no-print" style={{ display: "flex", gap: 10, marginBottom: 14 }}>
+          <button onClick={() => window.print()} style={smallBtn}>🖨️ {t("طباعة كل الملصقات", "Print all labels")}</button>
+          <button onClick={() => setShowPrint(false)} style={ghostBtn}>{t("رجوع", "Back")}</button>
+        </div>
+        <div className="print-area" style={{ display: "flex", flexWrap: "wrap", gap: 14 }}>
+          {selectedItems.map((it) => (
+            <div key={it.id} style={{ width: 160, border: "1px dashed " + C.border, borderRadius: 8, padding: 12, textAlign: "center", pageBreakInside: "avoid" }}>
+              <div style={{ fontWeight: 800, fontSize: 12.5, color: C.navy, marginBottom: 4 }}>{lang === "ar" ? (it.nameAr || it.nameEn) : (it.nameEn || it.nameAr)}</div>
+              <div style={{ fontSize: 10.5, color: C.muted, marginBottom: 6 }}>{fmt(it.price)} {t("ر.س", "SAR")} / {it.unit}</div>
+              <div style={{ display: "flex", justifyContent: "center" }}><ItemQRCode code={it.sku} size={100} /></div>
+              <div style={{ fontSize: 10, color: C.muted, marginTop: 6, fontFamily: "monospace" }}>{it.sku}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <div style={cardStyle} className="no-print">
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 14 }}>
+          <div style={{ ...cardTitle, marginBottom: 0, border: "none", padding: 0 }}>🖨️ {t("طباعة ملصقات بالجملة", "Bulk Label Printing")}</div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button onClick={selectAll} style={ghostBtn}>{t("تحديد الكل", "Select all")}</button>
+            <button onClick={clearAll} style={ghostBtn}>{t("إلغاء التحديد", "Clear")}</button>
+            <button onClick={() => setShowPrint(true)} disabled={selectedItems.length === 0} style={smallBtn}>
+              {t(`معاينة وطباعة (${selectedItems.length})`, `Preview & print (${selectedItems.length})`)}
+            </button>
+          </div>
+        </div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
+          {items.map((it) => (
+            <label key={it.id} style={{
+              display: "flex", alignItems: "center", gap: 8, padding: "8px 14px", borderRadius: 20, cursor: "pointer",
+              border: "1px solid " + (selected[it.id] ? C.blue : C.border), background: selected[it.id] ? C.blueSoft : "#fff",
+              fontSize: 13, fontWeight: selected[it.id] ? 700 : 400, color: selected[it.id] ? C.blue : C.text,
+            }}>
+              <input type="checkbox" checked={!!selected[it.id]} onChange={() => toggle(it.id)} />
+              {lang === "ar" ? (it.nameAr || it.nameEn) : (it.nameEn || it.nameAr)}
+            </label>
+          ))}
+          {items.length === 0 && <div style={{ color: "#9ca3af", fontSize: 13 }}>{t("لا يوجد أصناف", "No items")}</div>}
         </div>
       </div>
     </div>
@@ -614,6 +838,7 @@ function StockInTab({ currentUser, lang, t }) {
   const [supplierName, setSupplierName] = useState("");
   const [taxNumber, setTaxNumber] = useState("");
   const [invoiceNo, setInvoiceNo] = useState("");
+  const [expiryDate, setExpiryDate] = useState("");
   const [note, setNote] = useState("");
   const [saving, setSaving] = useState(false);
   const [msg, setMsg] = useState("");
@@ -674,8 +899,15 @@ function StockInTab({ currentUser, lang, t }) {
           createdAt: firebase.firestore.FieldValue.serverTimestamp(),
         });
       });
+      if (expiryDate) {
+        await BATCHES_COL.add({
+          itemId: selectedItem.id, itemName: selectedItem.nameAr, itemNameEn: selectedItem.nameEn, unit: selectedItem.unit,
+          qty: q, remainingQty: q, expiryDate, receivedDate: todayStr(), invoiceNo: invoiceNo.trim(),
+          institutionId: DEFAULT_INSTITUTION_ID, createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+        });
+      }
       setMsg("✅ " + t(`تم إضافة ${fmt(q)} ${selectedItem.unit} للمخزون`, `Added ${fmt(q)} ${selectedItem.unit} to stock`));
-      setSelectedItem(null); setQty(""); setUnitCost(""); setSupplierName(""); setTaxNumber(""); setInvoiceNo(""); setNote("");
+      setSelectedItem(null); setQty(""); setUnitCost(""); setSupplierName(""); setTaxNumber(""); setInvoiceNo(""); setExpiryDate(""); setNote("");
     } catch (e) { setMsg("Error: " + e.message); }
     setSaving(false);
   }
@@ -712,6 +944,10 @@ function StockInTab({ currentUser, lang, t }) {
           <div style={{ flex: "1 1 140px" }}>
             <label style={smallLabel}>{t("رقم الفاتورة", "Invoice number")}</label>
             <input value={invoiceNo} onChange={(e) => setInvoiceNo(e.target.value)} style={inputStyle2} />
+          </div>
+          <div style={{ flex: "1 1 150px" }}>
+            <label style={smallLabel}>📅 {t("تاريخ الصلاحية (اختياري)", "Expiry date (optional)")}</label>
+            <input type="date" value={expiryDate} onChange={(e) => setExpiryDate(e.target.value)} style={inputStyle2} />
           </div>
           <div style={{ flex: "1 1 180px" }}>
             <label style={smallLabel}>{t("ملاحظة (اختياري)", "Note (optional)")}</label>
@@ -878,6 +1114,111 @@ function StockOutVoucher({ voucher, institutionName, lang, t, onClose }) {
   );
 }
 
+/* ============ وضع مسح سريع للصرف: مسح صنف، إدخال كمية، تأكيد، وينتقل للصنف التالي مباشرة — لموظف واقف بالمخزن بجواله ============ */
+function QuickScanTab({ currentUser, meta, lang, t, institutionName }) {
+  const [items, setItems] = useState([]);
+  const [branch, setBranch] = useState("");
+  const [showScanner, setShowScanner] = useState(false);
+  const [pendingItem, setPendingItem] = useState(null);
+  const [qty, setQty] = useState("1");
+  const [sessionLog, setSessionLog] = useState([]);
+  const [msg, setMsg] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    const unsub = ITEMS_COL.orderBy("nameAr").onSnapshot((snap) => setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
+    return unsub;
+  }, []);
+  useEffect(() => { if (!branch && meta.branches?.length) setBranch(meta.branches[0]); }, [meta.branches]);
+
+  function onScanFound(code) {
+    setShowScanner(false);
+    const found = items.find((it) => it.sku === code);
+    if (found) { setPendingItem(found); setQty("1"); setMsg(""); }
+    else setMsg(t("الكود ده مش مسجّل لأي صنف", "This code isn't registered to any item"));
+  }
+
+  async function confirmAndNext() {
+    const q = Number(qty);
+    if (!pendingItem || !q || q <= 0) return;
+    setSaving(true);
+    try {
+      const bsRef = BRANCH_STOCK_COL.doc(branchStockDocId(branch, pendingItem.id));
+      await db.runTransaction(async (tx) => {
+        const ref = ITEMS_COL.doc(pendingItem.id);
+        const snap = await tx.get(ref);
+        const curQty = Number(snap.data().qty) || 0;
+        tx.update(ref, { qty: curQty - q });
+        const bsSnap = await tx.get(bsRef);
+        const curBranchQty = bsSnap.exists ? (Number(bsSnap.data().qty) || 0) : 0;
+        tx.set(bsRef, { branch, itemId: pendingItem.id, itemName: pendingItem.nameAr, qty: curBranchQty + q, institutionId: DEFAULT_INSTITUTION_ID }, { merge: true });
+        tx.set(MOVES_COL.doc(), {
+          itemId: pendingItem.id, itemName: pendingItem.nameAr, itemNameEn: pendingItem.nameEn, unit: pendingItem.unit,
+          price: pendingItem.price, type: "out", qty: q, branch, date: todayStr(),
+          note: t("مسح سريع", "Quick scan"), enteredBy: currentUser.name, institutionId: DEFAULT_INSTITUTION_ID,
+          createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+        });
+      });
+      setSessionLog((log) => [{ name: lang === "ar" ? pendingItem.nameAr : (pendingItem.nameEn || pendingItem.nameAr), qty: q, unit: pendingItem.unit }, ...log]);
+      setPendingItem(null); setQty("1");
+      setShowScanner(true); // يفتح الكاميرا تلقائيًا للصنف التالي
+    } catch (e) { setMsg("Error: " + e.message); }
+    setSaving(false);
+  }
+
+  return (
+    <div>
+      <div style={cardStyle}>
+        <div style={cardTitle}>⚡ {t("وضع المسح السريع — صرف لأكتر من صنف", "Quick Scan Mode — Issue Multiple Items")}</div>
+        <div style={{ fontSize: 12.5, color: C.muted, marginBottom: 14 }}>{t("اختر الفرع مرة واحدة، وبعدها امسح صنف، أدخل الكمية، أكّد — والكاميرا هتفتح تلقائيًا للصنف اللي بعده.", "Choose the branch once, then scan an item, enter quantity, confirm — the camera reopens automatically for the next item.")}</div>
+        <div style={{ marginBottom: 14 }}>
+          <label style={smallLabel}>{t("الفرع المستلم", "Receiving branch")}</label>
+          <select value={branch} onChange={(e) => setBranch(e.target.value)} style={{ ...inputStyle2, maxWidth: 240 }}>
+            {(meta.branches || []).map((b) => <option key={b} value={b}>{b}</option>)}
+          </select>
+        </div>
+
+        {pendingItem ? (
+          <div style={{ background: C.blueSoft, borderRadius: 12, padding: 16 }}>
+            <div style={{ fontWeight: 800, fontSize: 15, color: C.navy, marginBottom: 10 }}>{lang === "ar" ? pendingItem.nameAr : (pendingItem.nameEn || pendingItem.nameAr)}</div>
+            <div style={{ fontSize: 12, color: C.muted, marginBottom: 10 }}>{t("المتاح:", "Available:")} {fmt(pendingItem.qty)} {pendingItem.unit}</div>
+            <div style={{ display: "flex", gap: 10, alignItems: "flex-end" }}>
+              <div>
+                <label style={smallLabel}>{t("الكمية", "Quantity")}</label>
+                <input type="number" step="0.01" value={qty} onChange={(e) => setQty(e.target.value)} autoFocus style={{ ...inputStyle2, width: 120, fontSize: 18, fontWeight: 700 }} />
+              </div>
+              <button onClick={confirmAndNext} disabled={saving} style={{ ...smallBtn, padding: "12px 26px", fontSize: 15 }}>
+                {saving ? "..." : "✅ " + t("تأكيد وصنف تالي", "Confirm & next")}
+              </button>
+              <button onClick={() => { setPendingItem(null); setShowScanner(true); }} style={ghostBtn}>{t("تخطي", "Skip")}</button>
+            </div>
+          </div>
+        ) : (
+          <button onClick={() => setShowScanner(true)} disabled={!branch} style={{ ...smallBtn, width: "100%", padding: "18px 0", fontSize: 17 }}>
+            📷 {t("امسح الصنف التالي", "Scan next item")}
+          </button>
+        )}
+        {msg && <div style={{ marginTop: 10, fontSize: 13.5, color: C.danger }}>{msg}</div>}
+      </div>
+
+      {sessionLog.length > 0 && (
+        <div style={cardStyle}>
+          <div style={cardTitle}>📋 {t("أصناف اتصرفت في هذه الجلسة", "Items issued this session")} ({sessionLog.length})</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {sessionLog.map((s, i) => (
+              <div key={i} style={{ display: "flex", justifyContent: "space-between", background: "#f0fdf4", borderRadius: 8, padding: "8px 12px", fontSize: 13 }}>
+                <span style={{ fontWeight: 700 }}>{s.name}</span><span>{fmt(s.qty)} {s.unit}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {showScanner && <CameraScanner onScan={onScanFound} onClose={() => setShowScanner(false)} />}
+    </div>
+  );
+}
+
 /* ============ شاشة جرد الفروع: تحديد الكمية الفعلية لكل صنف بفرع معيّن، ومقارنتها بالمتوقع، وإرسال إشعار نقص ============ */
 function BranchCountTab({ currentUser, meta, lang, t }) {
   const [branch, setBranch] = useState("");
@@ -1000,6 +1341,82 @@ function BranchCountTab({ currentUser, meta, lang, t }) {
 }
 
 /* ============ شاشة الإشعارات (نقص الأصناف عند الفروع) ============ */
+/* ============ شاشة تتبّع تواريخ الصلاحية: كل الدفعات مرتّبة، مع تلوين القريب من الانتهاء أو المنتهي ============ */
+function ExpiryTab({ lang, t }) {
+  const [batches, setBatches] = useState(null);
+  const [markingId, setMarkingId] = useState(null);
+
+  useEffect(() => {
+    const unsub = BATCHES_COL.orderBy("expiryDate").onSnapshot((snap) => setBatches(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
+    return unsub;
+  }, []);
+
+  function daysUntil(dateStr) {
+    return Math.ceil((new Date(dateStr) - new Date(todayStr())) / 86400000);
+  }
+  function statusOf(days) {
+    if (days < 0) return "expired";
+    if (days <= 7) return "urgent";
+    if (days <= 30) return "soon";
+    return "ok";
+  }
+  const STATUS_STYLE = {
+    expired: { bg: "#fef2f2", color: C.danger, label: t("منتهي الصلاحية", "Expired") },
+    urgent: { bg: "#fff7ed", color: C.warn, label: t("قريب جدًا (أسبوع أو أقل)", "Very soon (≤7 days)") },
+    soon: { bg: "#fefce8", color: "#a16207", label: t("خلال شهر", "Within a month") },
+    ok: { bg: "#f0fdf4", color: C.success, label: t("سليم", "OK") },
+  };
+
+  async function markConsumed(id) {
+    setMarkingId(id);
+    await BATCHES_COL.doc(id).update({ remainingQty: 0 });
+    setMarkingId(null);
+  }
+
+  if (batches === null) return <div style={{ color: C.muted, padding: 20 }}>...</div>;
+  const activeBatches = batches.filter((b) => (b.remainingQty ?? b.qty) > 0);
+  const sorted = [...activeBatches].sort((a, b) => daysUntil(a.expiryDate) - daysUntil(b.expiryDate));
+
+  return (
+    <div>
+      <div style={cardStyle}>
+        <div style={cardTitle}>📅 {t("تتبّع تواريخ الصلاحية", "Expiry Date Tracking")}</div>
+        <div style={{ fontSize: 12.5, color: C.muted, marginBottom: 14 }}>{t("كل دفعة بضاعة سجّلت لها تاريخ صلاحية وقت الوارد، هتظهر هنا مرتّبة من الأقرب انتهاءً.", "Every batch you gave an expiry date to when receiving stock appears here, sorted by nearest expiry.")}</div>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 14 }}>
+          {Object.entries(STATUS_STYLE).map(([key, s]) => {
+            const count = sorted.filter((b) => statusOf(daysUntil(b.expiryDate)) === key).length;
+            if (count === 0) return null;
+            return <div key={key} style={{ background: s.bg, borderRadius: 10, padding: "8px 14px", fontSize: 13, fontWeight: 700, color: s.color }}>{s.label}: {count}</div>;
+          })}
+        </div>
+        <div style={{ overflowX: "auto" }}>
+          <table>
+            <thead><tr><th style={th}>{t("الصنف", "Item")}</th><th style={th}>{t("الكمية المتبقية", "Remaining qty")}</th><th style={th}>{t("تاريخ الاستلام", "Received")}</th><th style={th}>{t("تاريخ الصلاحية", "Expiry date")}</th><th style={th}>{t("الحالة", "Status")}</th><th style={th}></th></tr></thead>
+            <tbody>
+              {sorted.map((b) => {
+                const days = daysUntil(b.expiryDate);
+                const status = statusOf(days);
+                const s = STATUS_STYLE[status];
+                return (
+                  <tr key={b.id} style={{ background: s.bg }}>
+                    <td style={{ ...td, fontWeight: 700 }}>{lang === "ar" ? (b.itemName || b.itemNameEn) : (b.itemNameEn || b.itemName)}</td>
+                    <td style={td}>{fmt(b.remainingQty ?? b.qty)} {b.unit}</td>
+                    <td style={td}>{b.receivedDate}</td>
+                    <td style={td}>{b.expiryDate}</td>
+                    <td style={{ ...td, color: s.color, fontWeight: 700 }}>{s.label} {status !== "expired" && status !== "ok" ? `(${days} ${t("يوم", "days")})` : ""}</td>
+                    <td style={td}><span onClick={() => markConsumed(b.id)} style={{ cursor: "pointer", color: C.blue, fontWeight: 700 }}>{markingId === b.id ? "..." : t("تعليم كمستهلكة", "Mark consumed")}</span></td>
+                  </tr>
+                );
+              })}
+              {sorted.length === 0 && <tr><td colSpan={6} style={{ ...td, textAlign: "center", color: "#9ca3af" }}>{t("لا يوجد دفعات مسجّل لها تاريخ صلاحية", "No batches with an expiry date recorded")}</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function WarehouseNotificationsPanel({ lang, t }) {
   const [notifs, setNotifs] = useState([]);
   useEffect(() => {
@@ -1326,8 +1743,12 @@ function ReportsTab({ lang, t, institutionName }) {
 const TAB_DEFS_WH = [
   { id: "in", labelAr: "وارد للمستودع", labelEn: "Stock In" },
   { id: "out", labelAr: "صرف للفروع", labelEn: "Issue to Branch" },
+  { id: "quickscan", labelAr: "⚡ مسح سريع", labelEn: "⚡ Quick Scan" },
   { id: "count", labelAr: "جرد الفروع", labelEn: "Branch Count" },
   { id: "items", labelAr: "الأصناف", labelEn: "Items" },
+  { id: "labels", labelAr: "طباعة ملصقات", labelEn: "Print Labels" },
+  { id: "purchase", labelAr: "قائمة شراء مقترحة", labelEn: "Suggested Purchase" },
+  { id: "expiry", labelAr: "الصلاحية", labelEn: "Expiry" },
   { id: "reports", labelAr: "التقارير", labelEn: "Reports" },
   { id: "notifs", labelAr: "الإشعارات", labelEn: "Notifications" },
   { id: "settings", labelAr: "الإعدادات", labelEn: "Settings" },
@@ -1388,7 +1809,7 @@ function App() {
   if (!currentUser) return <LoginScreen users={users} onLogin={handleLogin} />;
 
   const visibleTabs = TAB_DEFS_WH.filter((tb) => {
-    if (["items", "in", "settings", "notifs"].includes(tb.id)) return canManageWarehouse(currentUser.role);
+    if (["items", "in", "settings", "notifs", "labels", "purchase", "expiry"].includes(tb.id)) return canManageWarehouse(currentUser.role);
     return true; // out, count, reports متاحة لكل الأدوار
   });
 
@@ -1426,8 +1847,12 @@ function App() {
       <div style={{ padding: 20, maxWidth: 1300, margin: "0 auto" }}>
         {tab === "in" && canManageWarehouse(currentUser.role) && <StockInTab currentUser={currentUser} lang={lang} t={t} />}
         {tab === "out" && <StockOutTab currentUser={currentUser} meta={meta} lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
+        {tab === "quickscan" && <QuickScanTab currentUser={currentUser} meta={meta} lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
         {tab === "count" && <BranchCountTab currentUser={currentUser} meta={meta} lang={lang} t={t} />}
         {tab === "items" && canManageWarehouse(currentUser.role) && <ItemsTab currentUser={currentUser} lang={lang} t={t} whMeta={whMeta} />}
+        {tab === "labels" && canManageWarehouse(currentUser.role) && <BulkLabelsTab lang={lang} t={t} />}
+        {tab === "purchase" && canManageWarehouse(currentUser.role) && <SuggestedPurchaseTab lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
+        {tab === "expiry" && canManageWarehouse(currentUser.role) && <ExpiryTab lang={lang} t={t} />}
         {tab === "reports" && <ReportsTab lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
         {tab === "notifs" && canManageWarehouse(currentUser.role) && <WarehouseNotificationsPanel lang={lang} t={t} />}
         {tab === "settings" && canManageWarehouse(currentUser.role) && <WarehouseSettingsTab meta={meta} whMeta={whMeta} t={t} />}
