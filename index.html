@@ -95,8 +95,16 @@ const ROLE_LABELS = {
   branch_manager: "مدير فرع", cashier: "كاشير", custody_holder: "أمين عهدة",
 };
 /* صلاحيات المستودع مبنية على نفس أدوار تطبيق الكاشير: الأدمن = تحكم كامل، مدير الفرع/الكاشير = يطلبوا بضاعة لفرعهم بس */
-function canManageWarehouse(role) { return role === "admin"; }
-function canRequestForBranch(role) { return ["admin", "branch_manager", "cashier"].includes(role); }
+/* أدوار مستقلة خاصة بالمستودع (مش مرتبطة بأدوار الكاشير) — مخزّنة في whMeta.userRoles = { [userId]: "wh_admin" | "wh_staff" } */
+function getWarehouseRole(currentUser, whMeta) {
+  const map = (whMeta && whMeta.userRoles) || {};
+  if (map[currentUser.id]) return map[currentUser.id];
+  if (currentUser.role === "admin") return "wh_admin"; // توافقًا مع الحسابات القديمة: الأدمن في الكاشير يفضل يدير المستودع افتراضيًا لحد ما يتحدد له دور واضح
+  return null;
+}
+function canManageWarehouse(currentUser, whMeta) { return getWarehouseRole(currentUser, whMeta) === "wh_admin"; }
+function canRequestForBranch(currentUser, whMeta) { const r = getWarehouseRole(currentUser, whMeta); return r === "wh_admin" || r === "wh_staff"; }
+const WAREHOUSE_ROLE_LABELS = { wh_admin: "مدير مستودع", wh_staff: "موظف مستودع" };
 
 /* ============ توليد QR لصنف (يشفّر كود الصنف فقط) — بيستخدم مكتبة qrcode-generator الموثوقة، بيرسم كصورة data URL ============ */
 function ItemQRCode({ code, size = 110 }) {
@@ -477,7 +485,7 @@ function ItemsTab({ currentUser, lang, t, whMeta }) {
 
 /* ============ نافذة عرض/طباعة ملصق الباركود لصنف واحد ============ */
 /* ============ شاشة الإعدادات: إدارة الفروع (مشتركة مع الكاشير) ووحدات القياس ============ */
-function WarehouseSettingsTab({ meta, whMeta, t }) {
+function WarehouseSettingsTab({ meta, whMeta, users, t }) {
   const [newBranch, setNewBranch] = useState("");
   const [newUnit, setNewUnit] = useState("");
   const [msg, setMsg] = useState("");
@@ -508,8 +516,43 @@ function WarehouseSettingsTab({ meta, whMeta, t }) {
     await WH_META_DOC.set({ units: current.filter((u) => u !== name) }, { merge: true });
   }
 
+  async function setUserWhRole(userId, role) {
+    const current = whMeta.userRoles || {};
+    if (!role) {
+      await WH_META_DOC.set({ userRoles: { [userId]: firebase.firestore.FieldValue.delete() } }, { merge: true });
+    } else {
+      await WH_META_DOC.set({ userRoles: { ...current, [userId]: role } }, { merge: true });
+    }
+  }
+
   return (
     <div>
+      <div style={cardStyle}>
+        <div style={cardTitle}>👥 {t("أدوار المستودع (مستقلة عن أدوار الكاشير)", "Warehouse Roles (independent from cashier roles)")}</div>
+        <div style={{ fontSize: 12.5, color: C.muted, marginBottom: 14 }}>{t("حدّد لكل مستخدم دوره في نظام المستودع تحديدًا: مدير مستودع (تحكم كامل) أو موظف مستودع (صرف وجرد وطلبات بس، من غير إدارة أصناف أو إعدادات).", "Assign each user their role specifically in the warehouse system: warehouse manager (full control) or warehouse staff (issue, count, and requests only).")}</div>
+        <div style={{ overflowX: "auto" }}>
+          <table>
+            <thead><tr><th style={th}>{t("المستخدم", "User")}</th><th style={th}>{t("دوره في الكاشير", "Cashier role")}</th><th style={th}>{t("دوره في المستودع", "Warehouse role")}</th></tr></thead>
+            <tbody>
+              {(users || []).map((u) => (
+                <tr key={u.id}>
+                  <td style={{ ...td, fontWeight: 700 }}>{u.name}</td>
+                  <td style={td}>{ROLE_LABELS[u.role] || u.role}</td>
+                  <td style={td}>
+                    <select value={(whMeta.userRoles || {})[u.id] || ""} onChange={(e) => setUserWhRole(u.id, e.target.value)} style={{ ...inputStyle2, maxWidth: 180 }}>
+                      <option value="">{t("بدون صلاحية مستودع", "No warehouse access")}</option>
+                      <option value="wh_admin">{t("مدير مستودع", "Warehouse manager")}</option>
+                      <option value="wh_staff">{t("موظف مستودع", "Warehouse staff")}</option>
+                    </select>
+                  </td>
+                </tr>
+              ))}
+              {(users || []).length === 0 && <tr><td colSpan={3} style={{ ...td, textAlign: "center", color: "#9ca3af" }}>{t("لا يوجد مستخدمين", "No users")}</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
       <div style={cardStyle}>
         <div style={cardTitle}>🏬 {t("إدارة الفروع", "Manage Branches")}</div>
         <div style={{ fontSize: 12.5, color: C.muted, marginBottom: 14 }}>{t("نفس الفروع المستخدمة في نظام الكاشير — أي تعديل هنا بينعكس هناك كمان", "Same branches used in the cashier system — changes here reflect there too")}</div>
@@ -636,6 +679,95 @@ function SuggestedPurchaseTab({ lang, t, institutionName }) {
           </table>
         </div>
       </div>
+    </div>
+  );
+}
+
+/* ============ كشف حساب المورد: كل فواتيره ومدفوعاته في حساب واحد متصل، بيوضح المديونية الحالية له ============ */
+function SupplierStatementTab({ lang, t, institutionName }) {
+  const [suppliers, setSuppliers] = useState([]);
+  const [moves, setMoves] = useState([]);
+  const [selectedSupplier, setSelectedSupplier] = useState("");
+
+  useEffect(() => {
+    const unsub = SUPPLIERS_COL.orderBy("name").onSnapshot((snap) => setSuppliers(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
+    return unsub;
+  }, []);
+  useEffect(() => {
+    const unsub = MOVES_COL.where("type", "==", "in").orderBy("createdAt", "desc").limit(2000).onSnapshot(
+      (snap) => setMoves(snap.docs.map((d) => ({ id: d.id, ...d.data() }))),
+      () => { MOVES_COL.orderBy("createdAt", "desc").limit(3000).onSnapshot((snap) => setMoves(snap.docs.map((d) => ({ id: d.id, ...d.data() })).filter((m) => m.type === "in"))); }
+    );
+    return unsub;
+  }, []);
+
+  useEffect(() => { if (!selectedSupplier && suppliers.length) setSelectedSupplier(suppliers[0].name); }, [suppliers]);
+
+  const supplierMoves = moves.filter((m) => m.supplierName === selectedSupplier).sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+  const totalPurchases = supplierMoves.reduce((s, m) => s + (Number(m.purchaseValue) || 0) + (Number(m.vatAmount) || 0), 0);
+  const totalPaid = supplierMoves.reduce((s, m) => s + (Number(m.paidAmount) || 0), 0);
+  const balance = totalPurchases - totalPaid; // موجب = مديونية عليك للمورد
+
+  function doPrint() { window.print(); }
+
+  return (
+    <div>
+      <div style={cardStyle} className="no-print">
+        <div style={cardTitle}>🏢 {t("كشف حساب مورد", "Supplier Account Statement")}</div>
+        <label style={smallLabel}>{t("اختر المورد", "Choose supplier")}</label>
+        <select value={selectedSupplier} onChange={(e) => setSelectedSupplier(e.target.value)} style={{ ...inputStyle2, maxWidth: 300 }}>
+          {suppliers.map((s) => <option key={s.id} value={s.name}>{s.name}</option>)}
+        </select>
+        {suppliers.length === 0 && <div style={{ marginTop: 10, color: "#9ca3af", fontSize: 13 }}>{t("لا يوجد موردين مسجّلين بعد", "No suppliers registered yet")}</div>}
+      </div>
+
+      {selectedSupplier && (
+        <div className="print-area">
+          <div className="print-only-header"><h2>{institutionName}</h2><div>{t("كشف حساب مورد", "Supplier Statement")} — {selectedSupplier}</div></div>
+
+          <div style={cardStyle}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }} className="no-print">
+              <div style={cardTitle}>{selectedSupplier}</div>
+              <button onClick={doPrint} style={ghostBtn}>🖨️ {t("طباعة الكشف", "Print statement")}</button>
+            </div>
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+              <div style={{ flex: "1 1 200px", background: C.blueSoft, borderRadius: 10, padding: "12px 14px" }}>
+                <div style={{ fontSize: 12, color: C.muted }}>{t("إجمالي المشتريات (شامل الضريبة)", "Total purchases (incl. VAT)")}</div>
+                <div style={{ fontSize: 19, fontWeight: 800, color: C.navy }}>{fmt(totalPurchases)}</div>
+              </div>
+              <div style={{ flex: "1 1 200px", background: C.blueSoft, borderRadius: 10, padding: "12px 14px" }}>
+                <div style={{ fontSize: 12, color: C.muted }}>{t("إجمالي المدفوع له", "Total paid")}</div>
+                <div style={{ fontSize: 19, fontWeight: 800, color: C.success }}>{fmt(totalPaid)}</div>
+              </div>
+              <div style={{
+                flex: "1 1 200px", borderRadius: 10, padding: "12px 14px",
+                background: balance > 0.009 ? "linear-gradient(135deg,#7c2d12,#c2410c)" : "linear-gradient(135deg,#0f2557,#1d4ed8)",
+              }}>
+                <div style={{ fontSize: 12, color: "#fde8e8" }}>{balance > 0.009 ? t("مديونية عليك للمورد", "Amount you owe supplier") : t("رصيد متسوّى", "Settled balance")}</div>
+                <div style={{ fontSize: 19, fontWeight: 800, color: "#fff" }}>{fmt(Math.abs(balance))}</div>
+              </div>
+            </div>
+          </div>
+
+          <div style={cardStyle}>
+            <div style={cardTitle}>📋 {t("كل فواتير هذا المورد بالترتيب الزمني", "All invoices with this supplier, chronologically")}</div>
+            <table>
+              <thead><tr><th style={th}>{t("التاريخ", "Date")}</th><th style={th}>{t("رقم الفاتورة", "Invoice #")}</th><th style={th}>{t("الصنف", "Item")}</th><th style={th}>{t("القيمة شامل الضريبة", "Value incl. VAT")}</th><th style={th}>{t("المدفوع", "Paid")}</th><th style={th}>{t("الحالة", "Status")}</th></tr></thead>
+              <tbody>
+                {supplierMoves.map((m) => (
+                  <tr key={m.id}>
+                    <td style={td}>{m.date}</td><td style={td}>{m.invoiceNo || "—"}</td><td style={td}>{m.itemName}</td>
+                    <td style={{ ...td, fontWeight: 700 }}>{fmt((Number(m.purchaseValue) || 0) + (Number(m.vatAmount) || 0))}</td>
+                    <td style={td}>{fmt(m.paidAmount)}</td>
+                    <td style={{ ...td, color: m.paymentStatus === "paid" ? C.success : C.danger, fontWeight: 700 }}>{m.paymentStatus === "paid" ? t("مدفوعة", "Paid") : t("غير مدفوعة", "Unpaid")}</td>
+                  </tr>
+                ))}
+                {supplierMoves.length === 0 && <tr><td colSpan={6} style={{ ...td, textAlign: "center", color: "#9ca3af" }}>{t("لا يوجد فواتير لهذا المورد", "No invoices for this supplier")}</td></tr>}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -962,7 +1094,7 @@ function StockInTab({ currentUser, lang, t }) {
         </div>
 
         <div style={{ fontWeight: 700, fontSize: 13.5, color: C.navy, marginBottom: 10 }}>➕ {t("أضف صنف للفاتورة", "Add item to invoice")}</div>
-        <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-end" }}>
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
           <div style={{ flex: "1 1 240px" }}>
             <ItemPicker items={items} lang={lang} t={t} onPick={setSelectedItem} selectedItem={selectedItem} />
           </div>
@@ -978,8 +1110,10 @@ function StockInTab({ currentUser, lang, t }) {
             <label style={smallLabel}>📅 {t("الصلاحية (اختياري)", "Expiry (optional)")}</label>
             <input type="date" value={expiryDate} onChange={(e) => setExpiryDate(e.target.value)} style={inputStyle2} />
           </div>
-          <button onClick={addLine} style={ghostBtn}>➕ {t("أضف للفاتورة", "Add to invoice")}</button>
         </div>
+        <button onClick={addLine} style={{
+          ...smallBtn, width: "100%", marginTop: 14, padding: "13px 0", fontSize: 15,
+        }}>➕ {t("أضف هذا الصنف للفاتورة", "Add this item to the invoice")}</button>
         {msg && <div style={{ marginTop: 10, fontSize: 13.5, color: msg.startsWith("✅") ? C.success : C.danger }}>{msg}</div>}
 
         {lines.length > 0 && (
@@ -1269,6 +1403,211 @@ function QuickScanTab({ currentUser, meta, lang, t, institutionName }) {
 }
 
 /* ============ شاشة جرد الفروع: تحديد الكمية الفعلية لكل صنف بفرع معيّن، ومقارنتها بالمتوقع، وإرسال إشعار نقص ============ */
+/* ============ طلب الفرع من المستودع الرئيسي: الشيف/موظف الفرع يطلب أصناف، وأمين المستودع يوافق (كلي/جزئي) أو يرفض ============ */
+function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin }) {
+  const [items, setItems] = useState([]);
+  const [branch, setBranch] = useState("");
+  const [lines, setLines] = useState([]);
+  const [selectedItem, setSelectedItem] = useState(null);
+  const [qty, setQty] = useState("");
+  const [note, setNote] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [myRequests, setMyRequests] = useState([]);
+  const [allRequests, setAllRequests] = useState([]);
+  const [filterStatus, setFilterStatus] = useState("pending");
+  const [approveQtys, setApproveQtys] = useState({}); // { requestId_lineIdx: qty }
+
+  useEffect(() => {
+    const unsub = ITEMS_COL.orderBy("nameAr").onSnapshot((snap) => setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
+    return unsub;
+  }, []);
+  useEffect(() => { if (!branch && meta.branches?.length) setBranch(meta.branches[0]); }, [meta.branches]);
+
+  useEffect(() => {
+    const unsub = REQUESTS_COL.orderBy("createdAt", "desc").limit(100).onSnapshot((snap) => {
+      const all = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      setAllRequests(all);
+      setMyRequests(all.filter((r) => r.requestedBy === currentUser.name));
+    });
+    return unsub;
+  }, [currentUser.name]);
+
+  function addLine() {
+    const q = Number(qty);
+    if (!selectedItem) { setMsg(t("اختر الصنف أولًا", "Choose an item first")); return; }
+    if (!q || q <= 0) { setMsg(t("أدخل كمية صحيحة أكبر من صفر", "Enter a quantity greater than zero")); return; }
+    setLines((ls) => [...ls, { key: uid(), itemId: selectedItem.id, itemName: selectedItem.nameAr, itemNameEn: selectedItem.nameEn, unit: selectedItem.unit, qtyRequested: q }]);
+    setSelectedItem(null); setQty(""); setMsg("");
+  }
+  function removeLine(key) { setLines((ls) => ls.filter((l) => l.key !== key)); }
+
+  async function submitRequest() {
+    if (lines.length === 0) { setMsg(t("ضيف صنف واحد على الأقل قبل إرسال الطلب", "Add at least one item before sending the request")); return; }
+    setSaving(true); setMsg("");
+    try {
+      await REQUESTS_COL.add({
+        branch, lines: lines.map((l) => ({ itemId: l.itemId, itemName: l.itemName, itemNameEn: l.itemNameEn, unit: l.unit, qtyRequested: l.qtyRequested, qtyApproved: 0 })),
+        note: note.trim(), status: "pending", requestedBy: currentUser.name, institutionId: DEFAULT_INSTITUTION_ID,
+        createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+      });
+      setLines([]); setNote("");
+      setMsg("✅ " + t("تم إرسال الطلب للمستودع الرئيسي للمراجعة", "Request sent to the main warehouse for review"));
+    } catch (e) { setMsg("Error: " + e.message); }
+    setSaving(false);
+  }
+
+  async function approveRequest(req, fulfillAll) {
+    setSaving(true); setMsg("");
+    try {
+      const finalLines = req.lines.map((l, i) => {
+        const key = req.id + "_" + i;
+        const q = fulfillAll ? l.qtyRequested : (Number(approveQtys[key]) || 0);
+        return { ...l, qtyApproved: q };
+      });
+      for (const l of finalLines) {
+        if (l.qtyApproved <= 0) continue;
+        const bsRef = BRANCH_STOCK_COL.doc(branchStockDocId(req.branch, l.itemId));
+        await db.runTransaction(async (tx) => {
+          const ref = ITEMS_COL.doc(l.itemId);
+          const snap = await tx.get(ref);
+          const curQty = Number(snap.data().qty) || 0;
+          tx.update(ref, { qty: curQty - l.qtyApproved });
+          const bsSnap = await tx.get(bsRef);
+          const curBranchQty = bsSnap.exists ? (Number(bsSnap.data().qty) || 0) : 0;
+          tx.set(bsRef, { branch: req.branch, itemId: l.itemId, itemName: l.itemName, qty: curBranchQty + l.qtyApproved, institutionId: DEFAULT_INSTITUTION_ID }, { merge: true });
+          tx.set(MOVES_COL.doc(), {
+            itemId: l.itemId, itemName: l.itemName, itemNameEn: l.itemNameEn, unit: l.unit,
+            type: "out", qty: l.qtyApproved, branch: req.branch, date: todayStr(),
+            note: t("تنفيذ طلب فرع", "Branch request fulfillment") + " #" + req.id.slice(0, 6),
+            enteredBy: currentUser.name, institutionId: DEFAULT_INSTITUTION_ID,
+            createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+          });
+        });
+      }
+      const allFulfilled = finalLines.every((l) => l.qtyApproved >= l.qtyRequested);
+      await REQUESTS_COL.doc(req.id).update({
+        lines: finalLines, status: allFulfilled ? "approved" : "partial",
+        reviewedBy: currentUser.name, reviewedAt: firebase.firestore.FieldValue.serverTimestamp(),
+      });
+      setMsg("✅ " + t("تم تنفيذ الطلب وصرف الأصناف للفرع", "Request fulfilled and items issued to the branch"));
+    } catch (e) { setMsg("Error: " + e.message); }
+    setSaving(false);
+  }
+
+  async function rejectRequest(req) {
+    if (!confirm(t("هل تريد رفض هذا الطلب؟", "Reject this request?"))) return;
+    await REQUESTS_COL.doc(req.id).update({ status: "rejected", reviewedBy: currentUser.name, reviewedAt: firebase.firestore.FieldValue.serverTimestamp() });
+  }
+
+  const STATUS_LABEL = { pending: t("قيد المراجعة", "Pending"), approved: t("تم التنفيذ بالكامل", "Fully fulfilled"), partial: t("تم التنفيذ جزئيًا", "Partially fulfilled"), rejected: t("مرفوض", "Rejected") };
+  const STATUS_COLOR = { pending: C.warn, approved: C.success, partial: "#a16207", rejected: C.danger };
+
+  const displayedRequests = isWhAdmin ? allRequests.filter((r) => filterStatus === "all" || r.status === filterStatus) : myRequests;
+
+  return (
+    <div>
+      <div style={cardStyle}>
+        <div style={cardTitle}>📋 {t("طلب أصناف من المستودع الرئيسي", "Request Items from Main Warehouse")}</div>
+        <div style={{ marginBottom: 14 }}>
+          <label style={smallLabel}>{t("الفرع الطالب", "Requesting branch")}</label>
+          <select value={branch} onChange={(e) => setBranch(e.target.value)} style={{ ...inputStyle2, maxWidth: 240 }}>
+            {(meta.branches || []).map((b) => <option key={b} value={b}>{b}</option>)}
+          </select>
+        </div>
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+          <div style={{ flex: "1 1 260px" }}>
+            <ItemPicker items={items} lang={lang} t={t} onPick={setSelectedItem} selectedItem={selectedItem} />
+          </div>
+          <div style={{ flex: "1 1 120px" }}>
+            <label style={smallLabel}>{t("الكمية المطلوبة", "Requested qty")} {selectedItem && `(${selectedItem.unit})`}</label>
+            <input type="number" step="0.01" value={qty} onChange={(e) => setQty(e.target.value)} style={inputStyle2} />
+          </div>
+        </div>
+        <button onClick={addLine} style={{ ...smallBtn, width: "100%", marginTop: 14, padding: "13px 0", fontSize: 15 }}>➕ {t("أضف هذا الصنف للطلب", "Add this item to the request")}</button>
+
+        {lines.length > 0 && (
+          <div style={{ marginTop: 18 }}>
+            <div style={{ fontWeight: 700, fontSize: 13.5, color: C.navy, marginBottom: 10 }}>🧾 {t("أصناف هذا الطلب", "Items in this request")} ({lines.length})</div>
+            <table>
+              <thead><tr><th style={th}>{t("الصنف", "Item")}</th><th style={th}>{t("الكمية المطلوبة", "Requested qty")}</th><th style={th}></th></tr></thead>
+              <tbody>
+                {lines.map((l) => (
+                  <tr key={l.key}>
+                    <td style={{ ...td, fontWeight: 700 }}>{lang === "ar" ? l.itemName : (l.itemNameEn || l.itemName)}</td>
+                    <td style={td}>{fmt(l.qtyRequested)} {l.unit}</td>
+                    <td style={td}><span onClick={() => removeLine(l.key)} style={{ cursor: "pointer", color: C.danger, fontWeight: 700 }}>{t("حذف", "Remove")}</span></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <div style={{ marginTop: 12 }}>
+              <label style={smallLabel}>{t("ملاحظة (اختياري)", "Note (optional)")}</label>
+              <input value={note} onChange={(e) => setNote(e.target.value)} style={{ ...inputStyle2, maxWidth: 400 }} />
+            </div>
+            <button onClick={submitRequest} disabled={saving} style={{ ...smallBtn, marginTop: 14, padding: "12px 26px", fontSize: 15 }}>
+              {saving ? t("جارِ الإرسال...", "Sending...") : "📤 " + t(`إرسال الطلب (${lines.length} صنف)`, `Send request (${lines.length} item(s))`)}
+            </button>
+          </div>
+        )}
+        {msg && <div style={{ marginTop: 10, fontSize: 13.5, color: msg.startsWith("✅") ? C.success : C.danger }}>{msg}</div>}
+      </div>
+
+      <div style={cardStyle}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 14 }}>
+          <div style={{ ...cardTitle, marginBottom: 0, border: "none", padding: 0 }}>🕒 {isWhAdmin ? t("كل طلبات الفروع", "All branch requests") : t("طلباتي السابقة", "My previous requests")}</div>
+          {isWhAdmin && (
+            <div style={{ display: "flex", gap: 8 }}>
+              {["pending", "approved", "partial", "rejected", "all"].map((s) => (
+                <button key={s} onClick={() => setFilterStatus(s)} style={filterStatus === s ? smallBtn : ghostBtn}>{s === "all" ? t("الكل", "All") : STATUS_LABEL[s]}</button>
+              ))}
+            </div>
+          )}
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          {displayedRequests.map((r) => (
+            <div key={r.id} style={{ border: "1px solid " + C.border, borderRadius: 10, padding: 14 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 8, marginBottom: 8 }}>
+                <div>
+                  <span style={{ fontWeight: 800, color: C.navy }}>{r.branch}</span>
+                  {isWhAdmin && <span style={{ fontSize: 12, color: C.muted }}> — {t("من:", "from:")} {r.requestedBy}</span>}
+                </div>
+                <span style={{ fontWeight: 700, color: STATUS_COLOR[r.status] }}>{STATUS_LABEL[r.status]}</span>
+              </div>
+              <table>
+                <thead><tr><th style={th}>{t("الصنف", "Item")}</th><th style={th}>{t("المطلوب", "Requested")}</th>{r.status !== "pending" && <th style={th}>{t("المنفَّذ", "Fulfilled")}</th>}{isWhAdmin && r.status === "pending" && <th style={th}>{t("كمية الموافقة", "Approve qty")}</th>}</tr></thead>
+                <tbody>
+                  {r.lines.map((l, i) => (
+                    <tr key={i}>
+                      <td style={td}>{lang === "ar" ? l.itemName : (l.itemNameEn || l.itemName)}</td>
+                      <td style={td}>{fmt(l.qtyRequested)} {l.unit}</td>
+                      {r.status !== "pending" && <td style={{ ...td, color: l.qtyApproved >= l.qtyRequested ? C.success : C.warn, fontWeight: 700 }}>{fmt(l.qtyApproved)}</td>}
+                      {isWhAdmin && r.status === "pending" && (
+                        <td style={td}>
+                          <input type="number" step="0.01" placeholder={String(l.qtyRequested)} onChange={(e) => setApproveQtys((a) => ({ ...a, [r.id + "_" + i]: e.target.value }))} style={{ ...inputStyle2, width: 100 }} />
+                        </td>
+                      )}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {r.note && <div style={{ fontSize: 12, color: C.muted, marginTop: 6 }}>{t("ملاحظة:", "Note:")} {r.note}</div>}
+              {isWhAdmin && r.status === "pending" && (
+                <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                  <button onClick={() => approveRequest(r, true)} disabled={saving} style={smallBtn}>✅ {t("موافقة كاملة (الكميات المطلوبة كلها)", "Approve fully (all requested quantities)")}</button>
+                  <button onClick={() => approveRequest(r, false)} disabled={saving} style={ghostBtn}>{t("موافقة بالكميات المكتوبة فوق", "Approve with amounts entered above")}</button>
+                  <button onClick={() => rejectRequest(r)} style={{ ...ghostBtn, color: C.danger, borderColor: C.danger }}>{t("رفض", "Reject")}</button>
+                </div>
+              )}
+            </div>
+          ))}
+          {displayedRequests.length === 0 && <div style={{ color: "#9ca3af", fontSize: 13, textAlign: "center" }}>{t("لا يوجد طلبات", "No requests")}</div>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function BranchCountTab({ currentUser, meta, lang, t }) {
   const [branch, setBranch] = useState("");
   const [branchStock, setBranchStock] = useState([]);
@@ -1790,25 +2129,141 @@ function ReportsTab({ lang, t, institutionName }) {
   );
 }
 const TAB_DEFS_WH = [
+  { id: "dashboard", labelAr: "🏠 لوحة التحكم", labelEn: "🏠 Dashboard" },
   { id: "in", labelAr: "وارد للمستودع", labelEn: "Stock In" },
   { id: "out", labelAr: "صرف للفروع", labelEn: "Issue to Branch" },
+  { id: "branchRequest", labelAr: "طلب من المستودع", labelEn: "Request from Warehouse" },
   { id: "quickscan", labelAr: "⚡ مسح سريع", labelEn: "⚡ Quick Scan" },
   { id: "count", labelAr: "جرد الفروع", labelEn: "Branch Count" },
   { id: "items", labelAr: "الأصناف", labelEn: "Items" },
   { id: "labels", labelAr: "طباعة ملصقات", labelEn: "Print Labels" },
   { id: "purchase", labelAr: "قائمة شراء مقترحة", labelEn: "Suggested Purchase" },
   { id: "expiry", labelAr: "الصلاحية", labelEn: "Expiry" },
+  { id: "suppliers", labelAr: "كشف حساب مورد", labelEn: "Supplier Statement" },
   { id: "reports", labelAr: "التقارير", labelEn: "Reports" },
   { id: "notifs", labelAr: "الإشعارات", labelEn: "Notifications" },
   { id: "settings", labelAr: "الإعدادات", labelEn: "Settings" },
 ];
+
+/* ============ لوحة التحكم الرئيسية: نظرة سريعة عند الدخول — أرصدة، تنبيهات، تحليل ذكي، طلبات معلّقة ============ */
+function WarehouseDashboard({ lang, t, setTab }) {
+  const [items, setItems] = useState([]);
+  const [moves, setMoves] = useState([]);
+  const [pendingRequests, setPendingRequests] = useState([]);
+  const [notifs, setNotifs] = useState([]);
+  const [batches, setBatches] = useState([]);
+
+  useEffect(() => {
+    const unsub = ITEMS_COL.orderBy("nameAr").onSnapshot((snap) => setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
+    return unsub;
+  }, []);
+  useEffect(() => {
+    const unsub = MOVES_COL.orderBy("createdAt", "desc").limit(1000).onSnapshot((snap) => setMoves(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
+    return unsub;
+  }, []);
+  useEffect(() => {
+    const unsub = REQUESTS_COL.orderBy("createdAt", "desc").limit(100).onSnapshot((snap) => setPendingRequests(snap.docs.map((d) => ({ id: d.id, ...d.data() })).filter((r) => r.status === "pending")));
+    return unsub;
+  }, []);
+  useEffect(() => {
+    const unsub = WH_NOTIF_COL.orderBy("createdAt", "desc").limit(10).onSnapshot((snap) => setNotifs(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
+    return unsub;
+  }, []);
+  useEffect(() => {
+    const unsub = BATCHES_COL.orderBy("expiryDate").onSnapshot((snap) => setBatches(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
+    return unsub;
+  }, []);
+
+  const totalValue = items.reduce((s, it) => s + (Number(it.qty) || 0) * (Number(it.price) || 0), 0);
+  const lowStockItems = items.filter((it) => it.minStock > 0 && (it.qty || 0) <= it.minStock);
+  const expiringSoon = batches.filter((b) => (b.remainingQty ?? b.qty) > 0 && Math.ceil((new Date(b.expiryDate) - new Date(todayStr())) / 86400000) <= 7);
+
+  // تحليل ذكي: أنماط استهلاك آخر 14 يوم
+  const smartInsights = useMemo(() => {
+    const list = [];
+    const fromDate = new Date(Date.now() - 14 * 86400000).toISOString().slice(0, 10);
+    const recent = moves.filter((m) => m.date >= fromDate);
+    const outByBranch = {};
+    recent.filter((m) => m.type === "out").forEach((m) => { outByBranch[m.branch] = (outByBranch[m.branch] || 0) + (Number(m.qty) || 0) * (Number(m.price) || 0); });
+    const branches = Object.entries(outByBranch).sort((a, b) => b[1] - a[1]);
+    if (branches.length > 1) {
+      const totalOut = branches.reduce((s, [, v]) => s + v, 0);
+      const pct = totalOut > 0 ? (branches[0][1] / totalOut) * 100 : 0;
+      if (pct >= 40) list.push({ kind: "info", text: t(`فرع "${branches[0][0]}" بياخد ${pct.toFixed(0)}% من إجمالي المسحوبات آخر أسبوعين.`, `Branch "${branches[0][0]}" accounts for ${pct.toFixed(0)}% of withdrawals in the last two weeks.`) });
+    }
+    if (lowStockItems.length > 0) list.push({ kind: "warning", text: t(`${lowStockItems.length} صنف تحت الحد الأدنى المسموح به.`, `${lowStockItems.length} item(s) below minimum stock.`) });
+    if (expiringSoon.length > 0) list.push({ kind: "warning", text: t(`${expiringSoon.length} دفعة هتنتهي صلاحيتها خلال أسبوع.`, `${expiringSoon.length} batch(es) expiring within a week.`) });
+    if (pendingRequests.length > 0) list.push({ kind: "info", text: t(`${pendingRequests.length} طلب من الفروع بانتظار موافقتك.`, `${pendingRequests.length} branch request(s) awaiting your approval.`) });
+    if (list.length === 0) list.push({ kind: "success", text: t("كل شيء مستقر — لا توجد ملاحظات تستدعي الانتباه حاليًا 🎉", "Everything looks stable — no issues need attention right now 🎉") });
+    return list;
+    // eslint-disable-next-line
+  }, [moves, lowStockItems, expiringSoon, pendingRequests]);
+
+  const KIND_STYLE = {
+    warning: { bg: "#fef2f2", border: "#fecaca", icon: "⚠️", color: "#991b1b" },
+    success: { bg: "#f0fdf4", border: "#bbf7d0", icon: "✅", color: "#166534" },
+    info: { bg: "#eff6ff", border: "#bfdbfe", icon: "ℹ️", color: "#1e40af" },
+  };
+
+  return (
+    <div>
+      <div style={{ ...cardStyle, background: "linear-gradient(135deg,#0f2557,#1d4ed8)", border: "none" }}>
+        <div style={{ fontSize: 20, fontWeight: 800, color: "#fff", marginBottom: 4 }}>📦 {t("لوحة تحكم المستودع", "Warehouse Dashboard")}</div>
+        <div style={{ fontSize: 13, color: "#c7d5f5" }}>{t("نظرة سريعة على وضع المخزون النهاردة", "A quick look at today's inventory status")}</div>
+      </div>
+
+      <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 18 }}>
+        <div onClick={() => setTab("reports")} style={{ flex: "1 1 200px", cursor: "pointer", background: "#fff", border: "1px solid " + C.border, borderRadius: 12, padding: "16px 18px" }}>
+          <div style={{ fontSize: 12, color: C.muted, marginBottom: 6 }}>💰 {t("قيمة المخزون الإجمالية", "Total stock value")}</div>
+          <div style={{ fontSize: 22, fontWeight: 800, color: C.navy }}>{fmt(totalValue)} {t("ر.س", "SAR")}</div>
+        </div>
+        <div onClick={() => setTab("items")} style={{ flex: "1 1 200px", cursor: "pointer", background: lowStockItems.length > 0 ? "#fef2f2" : "#fff", border: "1px solid " + C.border, borderRadius: 12, padding: "16px 18px" }}>
+          <div style={{ fontSize: 12, color: C.muted, marginBottom: 6 }}>⚠️ {t("أصناف تحت الحد الأدنى", "Below minimum")}</div>
+          <div style={{ fontSize: 22, fontWeight: 800, color: lowStockItems.length > 0 ? C.danger : C.navy }}>{lowStockItems.length}</div>
+        </div>
+        <div onClick={() => setTab("expiry")} style={{ flex: "1 1 200px", cursor: "pointer", background: expiringSoon.length > 0 ? "#fff7ed" : "#fff", border: "1px solid " + C.border, borderRadius: 12, padding: "16px 18px" }}>
+          <div style={{ fontSize: 12, color: C.muted, marginBottom: 6 }}>📅 {t("دفعات قريبة الصلاحية", "Batches expiring soon")}</div>
+          <div style={{ fontSize: 22, fontWeight: 800, color: expiringSoon.length > 0 ? C.warn : C.navy }}>{expiringSoon.length}</div>
+        </div>
+        <div onClick={() => setTab("branchRequest")} style={{
+          flex: "1 1 200px", cursor: "pointer", borderRadius: 12, padding: "16px 18px",
+          background: pendingRequests.length > 0 ? "linear-gradient(135deg,#7c2d12,#c2410c)" : "#fff", border: pendingRequests.length > 0 ? "none" : "1px solid " + C.border,
+        }}>
+          <div style={{ fontSize: 12, color: pendingRequests.length > 0 ? "#fed7aa" : C.muted, marginBottom: 6 }}>📋 {t("طلبات فروع معلّقة", "Pending branch requests")}</div>
+          <div style={{ fontSize: 22, fontWeight: 800, color: pendingRequests.length > 0 ? "#fff" : C.navy }}>{pendingRequests.length}</div>
+        </div>
+      </div>
+
+      <div style={{ background: "linear-gradient(135deg,#faf5ff,#f5f3ff)", border: "1px solid #ddd6fe", borderRadius: 14, padding: 20, marginBottom: 18 }}>
+        <div style={{ fontWeight: 800, fontSize: 15, color: "#5b21b6", marginBottom: 10 }}>🤖 {t("تحليل ذكي تلقائي", "Automatic smart analysis")}</div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {smartInsights.map((it, i) => {
+            const s = KIND_STYLE[it.kind];
+            return <div key={i} style={{ background: s.bg, border: "1px solid " + s.border, borderRadius: 10, padding: "10px 13px", fontSize: 13, color: s.color, display: "flex", gap: 8 }}><span>{s.icon}</span><span>{it.text}</span></div>;
+          })}
+        </div>
+      </div>
+
+      {notifs.length > 0 && (
+        <div style={cardStyle}>
+          <div style={cardTitle}>🔔 {t("آخر إشعارات النقص", "Recent shortage notifications")}</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {notifs.slice(0, 5).map((n) => (
+              <div key={n.id} style={{ fontSize: 12.5, background: "#fef2f2", borderRadius: 8, padding: "8px 12px", color: "#991b1b" }}>⚠️ {n.branch} — {n.date} ({(n.items || []).length} {t("صنف", "item(s)")})</div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
 
 function App() {
   const [users, setUsers] = useState(null);
   const [meta, setMeta] = useState(null);
   const [whMeta, setWhMeta] = useState(null);
   const [currentUser, setCurrentUser] = useState(null);
-  const [tab, setTab] = useState("in");
+  const [tab, setTab] = useState("dashboard");
   const [lang, setLang] = useState(localStorage.getItem("wh-lang") || "ar");
 
   function t(ar, en) { return lang === "ar" ? ar : en; }
@@ -1858,9 +2313,10 @@ function App() {
   if (!currentUser) return <LoginScreen users={users} onLogin={handleLogin} />;
 
   const visibleTabs = TAB_DEFS_WH.filter((tb) => {
-    if (["items", "in", "settings", "notifs", "labels", "purchase", "expiry"].includes(tb.id)) return canManageWarehouse(currentUser.role);
-    return true; // out, count, reports متاحة لكل الأدوار
+    if (["items", "in", "settings", "notifs", "labels", "purchase", "expiry", "suppliers", "dashboard"].includes(tb.id)) return canManageWarehouse(currentUser, whMeta);
+    return true; // out, count, reports, quickscan, branchRequest متاحة لمدير المستودع وموظفه
   });
+  const effectiveTab = visibleTabs.some((tb) => tb.id === tab) ? tab : (visibleTabs[0]?.id || "out");
 
   return (
     <div style={{ minHeight: "100vh" }}>
@@ -1873,7 +2329,7 @@ function App() {
           {visibleTabs.map((tb) => (
             <button key={tb.id} onClick={() => setTab(tb.id)} style={{
               padding: "8px 14px", borderRadius: 8, border: "none", cursor: "pointer", fontSize: 13, fontWeight: 700,
-              background: tab === tb.id ? "#fff" : "rgba(255,255,255,0.12)", color: tab === tb.id ? C.navy : "#fff",
+              background: effectiveTab === tb.id ? "#fff" : "rgba(255,255,255,0.12)", color: effectiveTab === tb.id ? C.navy : "#fff",
             }}>{lang === "ar" ? tb.labelAr : tb.labelEn}</button>
           ))}
         </div>
@@ -1886,7 +2342,7 @@ function App() {
           <button onClick={() => setLang(lang === "ar" ? "en" : "ar")} style={{
             background: "rgba(255,255,255,0.15)", color: "#fff", border: "none", borderRadius: 7, padding: "6px 12px", cursor: "pointer", fontWeight: 700,
           }}>{lang === "ar" ? "EN" : "AR"}</button>
-          <span style={{ background: "rgba(255,255,255,0.12)", padding: "6px 12px", borderRadius: 20 }}>{currentUser.name} · {ROLE_LABELS[currentUser.role]}</span>
+          <span style={{ background: "rgba(255,255,255,0.12)", padding: "6px 12px", borderRadius: 20 }}>{currentUser.name} · {WAREHOUSE_ROLE_LABELS[getWarehouseRole(currentUser, whMeta)] || t("بدون صلاحية مستودع", "No warehouse access")}</span>
           <button onClick={handleLogout} style={{ background: "#fff", color: C.danger, border: "none", borderRadius: 7, padding: "6px 12px", cursor: "pointer", fontWeight: 700 }}>
             {t("خروج", "Logout")}
           </button>
@@ -1894,17 +2350,20 @@ function App() {
       </div>
 
       <div style={{ padding: 20, maxWidth: 1300, margin: "0 auto" }}>
-        {tab === "in" && canManageWarehouse(currentUser.role) && <StockInTab currentUser={currentUser} lang={lang} t={t} />}
-        {tab === "out" && <StockOutTab currentUser={currentUser} meta={meta} lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
-        {tab === "quickscan" && <QuickScanTab currentUser={currentUser} meta={meta} lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
-        {tab === "count" && <BranchCountTab currentUser={currentUser} meta={meta} lang={lang} t={t} />}
-        {tab === "items" && canManageWarehouse(currentUser.role) && <ItemsTab currentUser={currentUser} lang={lang} t={t} whMeta={whMeta} />}
-        {tab === "labels" && canManageWarehouse(currentUser.role) && <BulkLabelsTab lang={lang} t={t} />}
-        {tab === "purchase" && canManageWarehouse(currentUser.role) && <SuggestedPurchaseTab lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
-        {tab === "expiry" && canManageWarehouse(currentUser.role) && <ExpiryTab lang={lang} t={t} />}
-        {tab === "reports" && <ReportsTab lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
-        {tab === "notifs" && canManageWarehouse(currentUser.role) && <WarehouseNotificationsPanel lang={lang} t={t} />}
-        {tab === "settings" && canManageWarehouse(currentUser.role) && <WarehouseSettingsTab meta={meta} whMeta={whMeta} t={t} />}
+        {effectiveTab === "dashboard" && canManageWarehouse(currentUser, whMeta) && <WarehouseDashboard lang={lang} t={t} setTab={setTab} />}
+        {effectiveTab === "in" && canManageWarehouse(currentUser, whMeta) && <StockInTab currentUser={currentUser} lang={lang} t={t} />}
+        {effectiveTab === "out" && <StockOutTab currentUser={currentUser} meta={meta} lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
+        {effectiveTab === "branchRequest" && <BranchRequestTab currentUser={currentUser} meta={meta} lang={lang} t={t} isWhAdmin={canManageWarehouse(currentUser, whMeta)} />}
+        {effectiveTab === "quickscan" && <QuickScanTab currentUser={currentUser} meta={meta} lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
+        {effectiveTab === "count" && <BranchCountTab currentUser={currentUser} meta={meta} lang={lang} t={t} />}
+        {effectiveTab === "items" && canManageWarehouse(currentUser, whMeta) && <ItemsTab currentUser={currentUser} lang={lang} t={t} whMeta={whMeta} />}
+        {effectiveTab === "labels" && canManageWarehouse(currentUser, whMeta) && <BulkLabelsTab lang={lang} t={t} />}
+        {effectiveTab === "purchase" && canManageWarehouse(currentUser, whMeta) && <SuggestedPurchaseTab lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
+        {effectiveTab === "expiry" && canManageWarehouse(currentUser, whMeta) && <ExpiryTab lang={lang} t={t} />}
+        {effectiveTab === "suppliers" && canManageWarehouse(currentUser, whMeta) && <SupplierStatementTab lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
+        {effectiveTab === "reports" && <ReportsTab lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
+        {effectiveTab === "notifs" && canManageWarehouse(currentUser, whMeta) && <WarehouseNotificationsPanel lang={lang} t={t} />}
+        {effectiveTab === "settings" && canManageWarehouse(currentUser, whMeta) && <WarehouseSettingsTab meta={meta} whMeta={whMeta} users={users} t={t} />}
       </div>
     </div>
   );
