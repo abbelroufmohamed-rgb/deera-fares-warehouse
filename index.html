@@ -110,6 +110,47 @@ const WAREHOUSE_ROLE_LABELS = { wh_admin: "مدير مستودع", wh_staff: "م
 
 /* ============ توليد QR لصنف (يشفّر كود الصنف فقط) — بيستخدم مكتبة qrcode-generator الموثوقة، بيرسم كصورة data URL ============ */
 /* ============ ضغط صورة داخل المتصفح قبل الحفظ (نفس أسلوب تطبيق الكاشير) — بيرجع data URL جاهز للتخزين في Firestore ============ */
+/* ============ شجرة الفروع (نفس بيانات الكاشير بالظبط — meta.branchTree): تجميع الفروع تحت المؤسسة/النشاط الأب ============ */
+function buildTreeChildren(nodes, parentId) {
+  return nodes.filter((n) => (n.parentId || null) === (parentId || null));
+}
+function collectDescendantBranchNames(nodeId, nodes) {
+  const node = nodes.find((n) => n.id === nodeId);
+  if (!node) return [];
+  let names = node.branchName ? [node.branchName] : [];
+  buildTreeChildren(nodes, nodeId).forEach((child) => { names = names.concat(collectDescendantBranchNames(child.id, nodes)); });
+  return Array.from(new Set(names));
+}
+/* بيرجع قائمة تجميعية: كل عقدة جذر (مؤسسة/نشاط) مع كل الفروع اللي تحتها — يستخدم في القوائم المنسّدة المجمّعة وفي تحليل حسب المؤسسة */
+function buildBranchGroups(branchTree) {
+  const tree = branchTree || [];
+  const roots = buildTreeChildren(tree, null);
+  return roots.map((root) => ({
+    id: root.id, name: root.name, branches: collectDescendantBranchNames(root.id, tree),
+  })).filter((g) => g.branches.length > 0);
+}
+
+/* بيترسم options مجمّعة تحت المؤسسة (لو فيه شجرة)، أو قائمة عادية لو لسه محدش بنى الشجرة */
+function GroupedBranchOptions({ meta }) {
+  const groups = buildBranchGroups(meta.branchTree);
+  const groupedNames = new Set(groups.flatMap((g) => g.branches));
+  const ungrouped = (meta.branches || []).filter((b) => !groupedNames.has(b));
+  return (
+    <>
+      {groups.map((g) => (
+        <optgroup key={g.id} label={g.name}>
+          {g.branches.map((b) => <option key={b} value={b}>{b}</option>)}
+        </optgroup>
+      ))}
+      {ungrouped.length > 0 && (
+        <optgroup label="فروع أخرى">
+          {ungrouped.map((b) => <option key={b} value={b}>{b}</option>)}
+        </optgroup>
+      )}
+    </>
+  );
+}
+
 function compressImage(file, maxDim, quality) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -523,6 +564,13 @@ function WarehouseSettingsTab({ meta, whMeta, users, t }) {
     setNewBranch(""); setMsg("✅ " + t("تمت إضافة الفرع", "Branch added"));
   }
   async function removeBranch(name) {
+    // نتأكد الأول إن الفرع ده مالوش أي أرصدة بضاعة معلّقة قبل ما نسمح بحذفه
+    const stockSnap = await BRANCH_STOCK_COL.where("branch", "==", name).get().catch(() => null);
+    const hasStock = stockSnap && stockSnap.docs.some((d) => (Number(d.data().qty) || 0) > 0.009);
+    if (hasStock) {
+      setMsg(t(`مينفعش تحذف فرع "${name}" — لسه فيه أرصدة بضاعة مسجّلة عليه. صفّي رصيده الأول من "جرد الفروع".`, `Can't delete "${name}" — it still has stock recorded. Clear its balance first from Branch Count.`));
+      return;
+    }
     if (!confirm(t(`حذف فرع "${name}"؟`, `Delete branch "${name}"?`))) return;
     await META_DOC.update({ branches: firebase.firestore.FieldValue.arrayRemove(name) });
   }
@@ -902,7 +950,7 @@ function EquipmentTab({ currentUser, meta, lang, t }) {
             <label style={smallLabel}>{t("الموقع/الفرع", "Location/Branch")}</label>
             <select value={form.branch} onChange={(e) => set("branch", e.target.value)} style={inputStyle2}>
               <option value="">{t("المستودع الرئيسي", "Main warehouse")}</option>
-              {(meta.branches || []).map((b) => <option key={b} value={b}>{b}</option>)}
+              <GroupedBranchOptions meta={meta} />
             </select>
           </div>
           <div style={{ flex: "1 1 160px" }}>
@@ -1461,7 +1509,7 @@ function StockOutTab({ currentUser, meta, lang, t, institutionName }) {
           <div style={{ flex: "1 1 160px" }}>
             <label style={smallLabel}>{t("الفرع المستلم", "Receiving branch")}</label>
             <select value={branch} onChange={(e) => setBranch(e.target.value)} style={inputStyle2}>
-              {(meta.branches || []).map((b) => <option key={b} value={b}>{b}</option>)}
+              <GroupedBranchOptions meta={meta} />
             </select>
           </div>
           <div style={{ flex: "1 1 180px" }}>
@@ -1579,7 +1627,7 @@ function QuickScanTab({ currentUser, meta, lang, t, institutionName }) {
         <div style={{ marginBottom: 14 }}>
           <label style={smallLabel}>{t("الفرع المستلم", "Receiving branch")}</label>
           <select value={branch} onChange={(e) => setBranch(e.target.value)} style={{ ...inputStyle2, maxWidth: 240 }}>
-            {(meta.branches || []).map((b) => <option key={b} value={b}>{b}</option>)}
+            <GroupedBranchOptions meta={meta} />
           </select>
         </div>
 
@@ -1639,6 +1687,7 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin }) {
   const [allRequests, setAllRequests] = useState([]);
   const [filterStatus, setFilterStatus] = useState("pending");
   const [approveQtys, setApproveQtys] = useState({}); // { requestId_lineIdx: qty }
+  const [freshApproval, setFreshApproval] = useState(null); // طلب اتوافق عليه حالًا، عشان نعرض ورقة طباعة فورية
 
   useEffect(() => {
     const unsub = ITEMS_COL.orderBy("nameAr").onSnapshot((snap) => setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
@@ -1713,6 +1762,7 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin }) {
         reviewedBy: currentUser.name, reviewedAt: firebase.firestore.FieldValue.serverTimestamp(),
       });
       setMsg("✅ " + t("تم تنفيذ الطلب وصرف الأصناف للفرع", "Request fulfilled and items issued to the branch"));
+      setFreshApproval({ ...req, lines: finalLines, reviewedBy: currentUser.name, reviewedAtDate: todayStr() });
     } catch (e) { setMsg("Error: " + e.message); }
     setSaving(false);
   }
@@ -1734,7 +1784,7 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin }) {
         <div style={{ marginBottom: 14 }}>
           <label style={smallLabel}>{t("الفرع الطالب", "Requesting branch")}</label>
           <select value={branch} onChange={(e) => setBranch(e.target.value)} style={{ ...inputStyle2, maxWidth: 240 }}>
-            {(meta.branches || []).map((b) => <option key={b} value={b}>{b}</option>)}
+            <GroupedBranchOptions meta={meta} />
           </select>
         </div>
         <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
@@ -1826,6 +1876,61 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin }) {
           {displayedRequests.length === 0 && <div style={{ color: "#9ca3af", fontSize: 13, textAlign: "center" }}>{t("لا يوجد طلبات", "No requests")}</div>}
         </div>
       </div>
+
+      {freshApproval && <BranchRequestVoucher req={freshApproval} lang={lang} t={t} onClose={() => setFreshApproval(null)} />}
+    </div>
+  );
+}
+
+/* ============ ورقة طباعة رسمية لتنفيذ طلب فرع: مين طلب، مين وافق، الفرع، التاريخ، والأصناف بالكميات المنفَّذة ============ */
+function BranchRequestVoucher({ req, lang, t, onClose }) {
+  return (
+    <div>
+      <div className="no-print" style={{ display: "flex", gap: 10, marginBottom: 14 }}>
+        <button onClick={() => window.print()} style={smallBtn}>🖨️ {t("طباعة ورقة التسليم", "Print handover sheet")}</button>
+        <button onClick={onClose} style={ghostBtn}>{t("إغلاق", "Close")}</button>
+      </div>
+      <div className="print-area">
+        <div className="print-only-header"><h2>{t("ورقة تسليم بضاعة من المستودع الرئيسي", "Main Warehouse Handover Sheet")}</h2></div>
+        <div style={{ ...cardStyle, border: "2px solid " + C.navy }}>
+          <div style={{ textAlign: "center", marginBottom: 16 }}>
+            <div style={{ fontWeight: 800, fontSize: 17, color: C.navy }}>{t("ورقة تسليم بضاعة", "Goods Handover Sheet")}</div>
+            <div style={{ fontSize: 13, color: C.muted }}>{t("رقم الطلب:", "Request #:")} {req.id.slice(0, 8)}</div>
+          </div>
+          <table>
+            <tbody>
+              <tr><td style={{ ...td, fontWeight: 700, width: 160 }}>{t("الفرع المستلم", "Receiving branch")}</td><td style={td}>{req.branch}</td></tr>
+              <tr><td style={{ ...td, fontWeight: 700 }}>{t("تاريخ الطلب", "Request date")}</td><td style={td}>{req.date}</td></tr>
+              <tr><td style={{ ...td, fontWeight: 700 }}>{t("تاريخ التنفيذ", "Fulfillment date")}</td><td style={td}>{req.reviewedAtDate}</td></tr>
+              <tr><td style={{ ...td, fontWeight: 700 }}>👤 {t("اسم الطالب (مقدّم الطلب)", "Requester name")}</td><td style={{ ...td, fontWeight: 700 }}>{req.requestedBy}</td></tr>
+              <tr><td style={{ ...td, fontWeight: 700 }}>✅ {t("اسم من وافق ونفّذ", "Approved & fulfilled by")}</td><td style={{ ...td, fontWeight: 700 }}>{req.reviewedBy}</td></tr>
+            </tbody>
+          </table>
+          <div style={{ fontWeight: 700, fontSize: 13.5, color: C.navy, margin: "16px 0 8px" }}>{t("الأصناف المسلَّمة", "Items handed over")}</div>
+          <table>
+            <thead><tr><th style={th}>{t("الصنف", "Item")}</th><th style={th}>{t("الكمية المطلوبة", "Requested")}</th><th style={th}>{t("الكمية المسلَّمة فعليًا", "Actually handed over")}</th></tr></thead>
+            <tbody>
+              {req.lines.map((l, i) => (
+                <tr key={i}>
+                  <td style={td}>{lang === "ar" ? l.itemName : (l.itemNameEn || l.itemName)}</td>
+                  <td style={td}>{fmt(l.qtyRequested)} {l.unit}</td>
+                  <td style={{ ...td, fontWeight: 700 }}>{fmt(l.qtyApproved)} {l.unit}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div style={{ display: "flex", justifyContent: "space-between", marginTop: 34, fontSize: 12.5 }}>
+            <div style={{ textAlign: "center", flex: 1 }}>
+              <div style={{ borderTop: "1px solid " + C.text, width: 140, margin: "0 auto 6px" }} />
+              {t("توقيع أمين المستودع", "Storekeeper signature")}<br /><b>{req.reviewedBy}</b>
+            </div>
+            <div style={{ textAlign: "center", flex: 1 }}>
+              <div style={{ borderTop: "1px solid " + C.text, width: 140, margin: "0 auto 6px" }} />
+              {t("توقيع مستلم الفرع", "Branch receiver signature")}<br /><b>{req.requestedBy}</b>
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
@@ -1897,7 +2002,7 @@ function BranchCountTab({ currentUser, meta, lang, t }) {
         <div style={{ marginBottom: 14 }}>
           <label style={smallLabel}>{t("الفرع", "Branch")}</label>
           <select value={branch} onChange={(e) => { setBranch(e.target.value); setCounted({}); }} style={{ ...inputStyle2, maxWidth: 260 }}>
-            {(meta.branches || []).map((b) => <option key={b} value={b}>{b}</option>)}
+            <GroupedBranchOptions meta={meta} />
           </select>
         </div>
         <div style={{ overflowX: "auto" }}>
@@ -2166,7 +2271,7 @@ function ReportsTab({ lang, t, institutionName }) {
                 <label style={smallLabel}>{t("الفرع", "Branch")}</label>
                 <select value={branchFilter} onChange={(e) => setBranchFilter(e.target.value)} style={inputStyle2}>
                   <option value="all">{t("كل الفروع", "All branches")}</option>
-                  {(meta.branches || []).map((b) => <option key={b} value={b}>{b}</option>)}
+                  <GroupedBranchOptions meta={meta} />
                 </select>
               </div>
             )}
@@ -2438,6 +2543,23 @@ function WarehouseDashboard({ lang, t, setTab, meta }) {
     // eslint-disable-next-line
   }, [moves, meta.branches]);
 
+  // تجميع نفس التحليل حسب المؤسسة/النشاط الأب (شجرة الفروع) — بيوضح كام صرفت كل مؤسسة إجمالًا بغض النظر عن فروعها
+  const byInstitutionAnalysis = useMemo(() => {
+    const groups = buildBranchGroups(meta.branchTree);
+    if (groups.length === 0) return [];
+    const branchValueMap = {};
+    byBranchAnalysis.forEach((b) => { branchValueMap[b.branch] = b; });
+    return groups.map((g) => {
+      const agg = { institution: g.name, qtyTotal: 0, valueTotal: 0, movesCount: 0, branchCount: g.branches.length };
+      g.branches.forEach((bName) => {
+        const b = branchValueMap[bName];
+        if (b) { agg.qtyTotal += b.qtyTotal; agg.valueTotal += b.valueTotal; agg.movesCount += b.movesCount; }
+      });
+      return agg;
+    }).sort((a, b) => b.valueTotal - a.valueTotal);
+    // eslint-disable-next-line
+  }, [byBranchAnalysis, meta.branchTree]);
+
   const KIND_STYLE = {
     warning: { bg: "#fef2f2", border: "#fecaca", icon: "⚠️", color: "#991b1b" },
     success: { bg: "#f0fdf4", border: "#bbf7d0", icon: "✅", color: "#166534" },
@@ -2482,6 +2604,28 @@ function WarehouseDashboard({ lang, t, setTab, meta }) {
           })}
         </div>
       </div>
+
+      {byInstitutionAnalysis.length > 0 && (
+        <div style={cardStyle}>
+          <div style={cardTitle}>🏢 {t("تحليل حسب المؤسسة/النشاط (آخر 30 يوم)", "Per-Institution Analysis (last 30 days)")}</div>
+          <div style={{ overflowX: "auto" }}>
+            <table>
+              <thead><tr><th style={th}>{t("المؤسسة/النشاط", "Institution/Activity")}</th><th style={th}>{t("عدد الفروع", "Branch count")}</th><th style={th}>{t("عدد عمليات الصرف", "Issue count")}</th><th style={th}>{t("إجمالي الكمية", "Total qty")}</th><th style={th}>{t("إجمالي القيمة", "Total value")}</th></tr></thead>
+              <tbody>
+                {byInstitutionAnalysis.map((g) => (
+                  <tr key={g.institution}>
+                    <td style={{ ...td, fontWeight: 800, color: C.navy }}>{g.institution}</td>
+                    <td style={td}>{g.branchCount}</td>
+                    <td style={td}>{g.movesCount}</td>
+                    <td style={td}>{fmt(g.qtyTotal)}</td>
+                    <td style={{ ...td, fontWeight: 700, color: C.navy }}>{fmt(g.valueTotal)} {t("ر.س", "SAR")}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
 
       <div style={cardStyle}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
