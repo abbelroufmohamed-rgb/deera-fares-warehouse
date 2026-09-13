@@ -89,6 +89,8 @@ const BRANCH_STOCK_COL = db.collection("whBranchStock"); // مخزون كل فر
 const WH_NOTIF_COL = db.collection("whNotifications");
 const SUPPLIERS_COL = db.collection("whSuppliers");
 const BATCHES_COL = db.collection("whBatches"); // دفعات الوارد بتواريخ صلاحيتها
+const EQUIPMENT_COL = db.collection("whEquipment"); // معدات المستودع/الفروع (أجهزة، ماكينات) بالصور والضمان
+const MAINTENANCE_COL = db.collection("whMaintenance"); // سجل صيانة كل معدة
 
 const ROLE_LABELS = {
   admin: "أدمن", financial_manager: "مدير مالي", accountant: "محاسب",
@@ -107,6 +109,29 @@ function canRequestForBranch(currentUser, whMeta) { const r = getWarehouseRole(c
 const WAREHOUSE_ROLE_LABELS = { wh_admin: "مدير مستودع", wh_staff: "موظف مستودع" };
 
 /* ============ توليد QR لصنف (يشفّر كود الصنف فقط) — بيستخدم مكتبة qrcode-generator الموثوقة، بيرسم كصورة data URL ============ */
+/* ============ ضغط صورة داخل المتصفح قبل الحفظ (نفس أسلوب تطبيق الكاشير) — بيرجع data URL جاهز للتخزين في Firestore ============ */
+function compressImage(file, maxDim, quality) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        let { width, height } = img;
+        if (width > height && width > maxDim) { height = Math.round((height * maxDim) / width); width = maxDim; }
+        else if (height > maxDim) { width = Math.round((width * maxDim) / height); height = maxDim; }
+        const canvas = document.createElement("canvas");
+        canvas.width = width; canvas.height = height;
+        canvas.getContext("2d").drawImage(img, 0, 0, width, height);
+        resolve(canvas.toDataURL("image/jpeg", quality));
+      };
+      img.onerror = reject;
+      img.src = e.target.result;
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
 function ItemQRCode({ code, size = 110 }) {
   const [dataUrl, setDataUrl] = useState("");
   useEffect(() => {
@@ -768,6 +793,203 @@ function SupplierStatementTab({ lang, t, institutionName }) {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+/* ============ المعدات والصيانة: تسجيل معدات المستودع/الفروع بصورها وضمانها، ومتابعة سجل صيانة كل معدة ============ */
+function EquipmentTab({ currentUser, meta, lang, t }) {
+  const [equipment, setEquipment] = useState(null);
+  const [form, setForm] = useState(emptyEquip());
+  const [editingId, setEditingId] = useState(null);
+  const [photo, setPhoto] = useState(null);
+  const [uploading, setUploading] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [openId, setOpenId] = useState(null); // معدة مفتوحة لعرض سجل صيانتها
+  const [maintenance, setMaintenance] = useState({}); // { equipmentId: [...] }
+  const [maintForm, setMaintForm] = useState({ date: todayStr(), description: "", cost: "", performedBy: "" });
+  const fileInputRef = useRef(null);
+
+  function emptyEquip() { return { name: "", branch: "", supplier: "", purchaseDate: todayStr(), cost: "", warrantyExpiry: "" }; }
+
+  useEffect(() => {
+    const unsub = EQUIPMENT_COL.orderBy("name").onSnapshot((snap) => setEquipment(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
+    return unsub;
+  }, []);
+
+  function set(key, val) { setForm((f) => ({ ...f, [key]: val })); }
+
+  async function onPhotoSelect(file) {
+    if (!file) return;
+    setUploading(true);
+    try {
+      let dataUrl = await compressImage(file, 900, 0.55);
+      if (dataUrl.length > 600000) dataUrl = await compressImage(file, 650, 0.4);
+      setPhoto(dataUrl);
+    } catch (e) { setMsg(t("تعذر تجهيز الصورة: ", "Could not process photo: ") + e.message); }
+    setUploading(false);
+  }
+
+  async function save() {
+    if (!form.name.trim()) { setMsg(t("اكتب اسم المعدة", "Enter equipment name")); return; }
+    try {
+      const payload = {
+        name: form.name.trim(), branch: form.branch, supplier: form.supplier.trim(),
+        purchaseDate: form.purchaseDate, cost: Number(form.cost) || 0, warrantyExpiry: form.warrantyExpiry,
+        photoUrl: photo || (editingId ? undefined : null),
+      };
+      // ما نمسحش الصورة الحالية لو مافيش صورة جديدة وقت التعديل
+      if (payload.photoUrl === undefined) delete payload.photoUrl;
+      if (editingId) {
+        await EQUIPMENT_COL.doc(editingId).update(payload);
+        setMsg("✅ " + t("تم تحديث المعدة", "Equipment updated"));
+      } else {
+        await EQUIPMENT_COL.add({ ...payload, photoUrl: photo || null, institutionId: DEFAULT_INSTITUTION_ID, createdAt: firebase.firestore.FieldValue.serverTimestamp() });
+        setMsg("✅ " + t("تمت إضافة المعدة", "Equipment added"));
+      }
+      setForm(emptyEquip()); setPhoto(null); setEditingId(null);
+    } catch (e) { setMsg("Error: " + e.message); }
+  }
+
+  function editEquip(eq) {
+    setForm({ name: eq.name, branch: eq.branch || "", supplier: eq.supplier || "", purchaseDate: eq.purchaseDate || todayStr(), cost: eq.cost || "", warrantyExpiry: eq.warrantyExpiry || "" });
+    setPhoto(null); setEditingId(eq.id);
+  }
+  async function removeEquip(eq) {
+    if (!confirm(t(`حذف معدة "${eq.name}"؟`, `Delete equipment "${eq.name}"?`))) return;
+    await EQUIPMENT_COL.doc(eq.id).delete();
+  }
+
+  async function loadMaintenance(equipId) {
+    setOpenId(openId === equipId ? null : equipId);
+    if (maintenance[equipId]) return;
+    const snap = await MAINTENANCE_COL.where("equipmentId", "==", equipId).get().catch(() => null);
+    if (snap) setMaintenance((m) => ({ ...m, [equipId]: snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => (b.date || "").localeCompare(a.date || "")) }));
+  }
+
+  async function addMaintenance(equipId) {
+    if (!maintForm.description.trim()) { setMsg(t("اكتب وصف أعمال الصيانة", "Describe the maintenance work")); return; }
+    await MAINTENANCE_COL.add({
+      equipmentId: equipId, date: maintForm.date, description: maintForm.description.trim(),
+      cost: Number(maintForm.cost) || 0, performedBy: maintForm.performedBy.trim() || currentUser.name,
+      institutionId: DEFAULT_INSTITUTION_ID, createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+    });
+    const snap = await MAINTENANCE_COL.where("equipmentId", "==", equipId).get();
+    setMaintenance((m) => ({ ...m, [equipId]: snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => (b.date || "").localeCompare(a.date || "")) }));
+    setMaintForm({ date: todayStr(), description: "", cost: "", performedBy: "" });
+  }
+
+  function warrantyStatus(expiry) {
+    if (!expiry) return null;
+    const days = Math.ceil((new Date(expiry) - new Date(todayStr())) / 86400000);
+    if (days < 0) return { label: t("انتهى الضمان", "Warranty expired"), color: C.danger };
+    if (days <= 30) return { label: t(`الضمان هينتهي خلال ${days} يوم`, `Warranty expires in ${days} days`), color: C.warn };
+    return { label: t("تحت الضمان", "Under warranty"), color: C.success };
+  }
+
+  if (equipment === null) return <div style={{ color: C.muted, padding: 20 }}>...</div>;
+
+  return (
+    <div>
+      <div style={cardStyle}>
+        <div style={cardTitle}>{editingId ? "✏️ " + t("تعديل معدة", "Edit equipment") : "➕ " + t("معدة جديدة", "New equipment")}</div>
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+          <div style={{ flex: "1 1 200px" }}>
+            <label style={smallLabel}>{t("اسم المعدة", "Equipment name")}</label>
+            <input value={form.name} onChange={(e) => set("name", e.target.value)} style={inputStyle2} placeholder={t("مثال: ماكينة إسبريسو", "e.g. Espresso machine")} />
+          </div>
+          <div style={{ flex: "1 1 160px" }}>
+            <label style={smallLabel}>{t("الموقع/الفرع", "Location/Branch")}</label>
+            <select value={form.branch} onChange={(e) => set("branch", e.target.value)} style={inputStyle2}>
+              <option value="">{t("المستودع الرئيسي", "Main warehouse")}</option>
+              {(meta.branches || []).map((b) => <option key={b} value={b}>{b}</option>)}
+            </select>
+          </div>
+          <div style={{ flex: "1 1 160px" }}>
+            <label style={smallLabel}>{t("المورد", "Supplier")}</label>
+            <input value={form.supplier} onChange={(e) => set("supplier", e.target.value)} style={inputStyle2} />
+          </div>
+          <div style={{ flex: "1 1 140px" }}>
+            <label style={smallLabel}>{t("تاريخ الشراء", "Purchase date")}</label>
+            <input type="date" value={form.purchaseDate} onChange={(e) => set("purchaseDate", e.target.value)} style={inputStyle2} />
+          </div>
+          <div style={{ flex: "1 1 120px" }}>
+            <label style={smallLabel}>{t("التكلفة", "Cost")}</label>
+            <input type="number" step="0.01" value={form.cost} onChange={(e) => set("cost", e.target.value)} style={inputStyle2} />
+          </div>
+          <div style={{ flex: "1 1 160px" }}>
+            <label style={smallLabel}>🛡️ {t("تاريخ انتهاء الضمان", "Warranty expiry")}</label>
+            <input type="date" value={form.warrantyExpiry} onChange={(e) => set("warrantyExpiry", e.target.value)} style={inputStyle2} />
+          </div>
+          <div style={{ flex: "1 1 200px" }}>
+            <label style={smallLabel}>📷 {t("صورة المعدة", "Equipment photo")}</label>
+            <input type="file" accept="image/*" ref={fileInputRef} style={{ display: "none" }} onChange={(e) => onPhotoSelect(e.target.files[0])} />
+            <button type="button" onClick={() => fileInputRef.current?.click()} disabled={uploading} style={ghostBtn}>
+              {uploading ? t("جارِ التجهيز...", "Processing...") : (photo ? t("✅ صورة مرفقة — تغيير", "✅ Photo attached — change") : t("رفع صورة", "Upload photo"))}
+            </button>
+          </div>
+        </div>
+        {photo && <img src={photo} alt="" style={{ width: 90, height: 90, objectFit: "cover", borderRadius: 8, marginTop: 10, border: "1px solid " + C.border }} />}
+        <div style={{ marginTop: 14, display: "flex", gap: 10, alignItems: "center" }}>
+          <button onClick={save} style={smallBtn}>{editingId ? t("💾 حفظ التعديل", "💾 Save changes") : t("➕ إضافة المعدة", "➕ Add equipment")}</button>
+          {editingId && <button onClick={() => { setForm(emptyEquip()); setPhoto(null); setEditingId(null); }} style={ghostBtn}>{t("إلغاء", "Cancel")}</button>}
+          {msg && <span style={{ fontSize: 13, color: msg.startsWith("✅") ? C.success : C.danger }}>{msg}</span>}
+        </div>
+      </div>
+
+      <div style={cardStyle}>
+        <div style={cardTitle}>🔧 {t("كل المعدات", "All Equipment")} ({equipment.length})</div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          {equipment.map((eq) => {
+            const wStatus = warrantyStatus(eq.warrantyExpiry);
+            return (
+              <div key={eq.id} style={{ border: "1px solid " + C.border, borderRadius: 10, padding: 14 }}>
+                <div style={{ display: "flex", gap: 14, alignItems: "flex-start", flexWrap: "wrap" }}>
+                  {eq.photoUrl ? (
+                    <img src={eq.photoUrl} alt="" style={{ width: 70, height: 70, objectFit: "cover", borderRadius: 8, border: "1px solid " + C.border }} />
+                  ) : (
+                    <div style={{ width: 70, height: 70, borderRadius: 8, background: "#f3f4f6", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24 }}>🔧</div>
+                  )}
+                  <div style={{ flex: 1, minWidth: 200 }}>
+                    <div style={{ fontWeight: 800, fontSize: 15, color: C.navy }}>{eq.name}</div>
+                    <div style={{ fontSize: 12, color: C.muted }}>{eq.branch || t("المستودع الرئيسي", "Main warehouse")} — {eq.supplier || "—"}</div>
+                    <div style={{ fontSize: 12, color: C.muted }}>{t("تكلفة الشراء:", "Purchase cost:")} {fmt(eq.cost)} {t("ر.س", "SAR")} — {eq.purchaseDate}</div>
+                    {wStatus && <div style={{ fontSize: 12.5, fontWeight: 700, color: wStatus.color, marginTop: 4 }}>🛡️ {wStatus.label} ({eq.warrantyExpiry})</div>}
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6, alignItems: "flex-end" }}>
+                    <span onClick={() => editEquip(eq)} style={{ cursor: "pointer", color: C.blue, fontWeight: 700, fontSize: 13 }}>{t("تعديل", "Edit")}</span>
+                    <span onClick={() => removeEquip(eq)} style={{ cursor: "pointer", color: C.danger, fontWeight: 700, fontSize: 13 }}>{t("حذف", "Delete")}</span>
+                    <span onClick={() => loadMaintenance(eq.id)} style={{ cursor: "pointer", color: C.navy, fontWeight: 700, fontSize: 13 }}>🔧 {openId === eq.id ? t("إخفاء الصيانة", "Hide maintenance") : t("سجل الصيانة", "Maintenance log")}</span>
+                  </div>
+                </div>
+
+                {openId === eq.id && (
+                  <div style={{ marginTop: 14, paddingTop: 14, borderTop: "1px dashed " + C.border }}>
+                    <div style={{ fontWeight: 700, fontSize: 13, color: C.navy, marginBottom: 10 }}>➕ {t("تسجيل صيانة جديدة", "Log new maintenance")}</div>
+                    <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-end" }}>
+                      <div><label style={smallLabel}>{t("التاريخ", "Date")}</label><input type="date" value={maintForm.date} onChange={(e) => setMaintForm((f) => ({ ...f, date: e.target.value }))} style={inputStyle2} /></div>
+                      <div style={{ flex: "1 1 200px" }}><label style={smallLabel}>{t("وصف الصيانة", "Maintenance description")}</label><input value={maintForm.description} onChange={(e) => setMaintForm((f) => ({ ...f, description: e.target.value }))} style={inputStyle2} /></div>
+                      <div><label style={smallLabel}>{t("التكلفة", "Cost")}</label><input type="number" step="0.01" value={maintForm.cost} onChange={(e) => setMaintForm((f) => ({ ...f, cost: e.target.value }))} style={{ ...inputStyle2, width: 110 }} /></div>
+                      <div><label style={smallLabel}>{t("بواسطة", "By")}</label><input value={maintForm.performedBy} onChange={(e) => setMaintForm((f) => ({ ...f, performedBy: e.target.value }))} placeholder={currentUser.name} style={inputStyle2} /></div>
+                      <button onClick={() => addMaintenance(eq.id)} style={ghostBtn}>➕ {t("تسجيل", "Log")}</button>
+                    </div>
+                    <table style={{ marginTop: 12 }}>
+                      <thead><tr><th style={th}>{t("التاريخ", "Date")}</th><th style={th}>{t("الوصف", "Description")}</th><th style={th}>{t("التكلفة", "Cost")}</th><th style={th}>{t("بواسطة", "By")}</th></tr></thead>
+                      <tbody>
+                        {(maintenance[eq.id] || []).map((mrec) => (
+                          <tr key={mrec.id}><td style={td}>{mrec.date}</td><td style={td}>{mrec.description}</td><td style={td}>{fmt(mrec.cost)}</td><td style={td}>{mrec.performedBy}</td></tr>
+                        ))}
+                        {(maintenance[eq.id] || []).length === 0 && <tr><td colSpan={4} style={{ ...td, textAlign: "center", color: "#9ca3af" }}>{t("لا يوجد سجل صيانة بعد", "No maintenance logged yet")}</td></tr>}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+          {equipment.length === 0 && <div style={{ color: "#9ca3af", fontSize: 13, textAlign: "center" }}>{t("لا يوجد معدات مسجّلة", "No equipment registered")}</div>}
+        </div>
+      </div>
     </div>
   );
 }
@@ -2139,6 +2361,7 @@ const TAB_DEFS_WH = [
   { id: "labels", labelAr: "طباعة ملصقات", labelEn: "Print Labels" },
   { id: "purchase", labelAr: "قائمة شراء مقترحة", labelEn: "Suggested Purchase" },
   { id: "expiry", labelAr: "الصلاحية", labelEn: "Expiry" },
+  { id: "equipment", labelAr: "🔧 المعدات والصيانة", labelEn: "🔧 Equipment & Maintenance" },
   { id: "suppliers", labelAr: "كشف حساب مورد", labelEn: "Supplier Statement" },
   { id: "reports", labelAr: "التقارير", labelEn: "Reports" },
   { id: "notifs", labelAr: "الإشعارات", labelEn: "Notifications" },
@@ -2146,7 +2369,7 @@ const TAB_DEFS_WH = [
 ];
 
 /* ============ لوحة التحكم الرئيسية: نظرة سريعة عند الدخول — أرصدة، تنبيهات، تحليل ذكي، طلبات معلّقة ============ */
-function WarehouseDashboard({ lang, t, setTab }) {
+function WarehouseDashboard({ lang, t, setTab, meta }) {
   const [items, setItems] = useState([]);
   const [moves, setMoves] = useState([]);
   const [pendingRequests, setPendingRequests] = useState([]);
@@ -2199,6 +2422,22 @@ function WarehouseDashboard({ lang, t, setTab }) {
     // eslint-disable-next-line
   }, [moves, lowStockItems, expiringSoon, pendingRequests]);
 
+  // تحليل مستقل لكل فرع: كام سحب كل فرع وبأي قيمة، خلال آخر 30 يوم
+  const byBranchAnalysis = useMemo(() => {
+    const fromDate = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
+    const map = {};
+    (meta.branches || []).forEach((b) => { map[b] = { branch: b, qtyTotal: 0, valueTotal: 0, movesCount: 0 }; });
+    moves.filter((m) => m.type === "out" && m.date >= fromDate).forEach((m) => {
+      const key = m.branch || t("غير محدد", "Unspecified");
+      if (!map[key]) map[key] = { branch: key, qtyTotal: 0, valueTotal: 0, movesCount: 0 };
+      map[key].qtyTotal += Number(m.qty) || 0;
+      map[key].valueTotal += (Number(m.qty) || 0) * (Number(m.price) || 0);
+      map[key].movesCount += 1;
+    });
+    return Object.values(map).sort((a, b) => b.valueTotal - a.valueTotal);
+    // eslint-disable-next-line
+  }, [moves, meta.branches]);
+
   const KIND_STYLE = {
     warning: { bg: "#fef2f2", border: "#fecaca", icon: "⚠️", color: "#991b1b" },
     success: { bg: "#f0fdf4", border: "#bbf7d0", icon: "✅", color: "#166534" },
@@ -2241,6 +2480,29 @@ function WarehouseDashboard({ lang, t, setTab }) {
             const s = KIND_STYLE[it.kind];
             return <div key={i} style={{ background: s.bg, border: "1px solid " + s.border, borderRadius: 10, padding: "10px 13px", fontSize: 13, color: s.color, display: "flex", gap: 8 }}><span>{s.icon}</span><span>{it.text}</span></div>;
           })}
+        </div>
+      </div>
+
+      <div style={cardStyle}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+          <div style={{ ...cardTitle, marginBottom: 0, border: "none", padding: 0 }}>🏬 {t("تحليل مستقل لكل فرع (آخر 30 يوم)", "Per-Branch Analysis (last 30 days)")}</div>
+          <button onClick={() => setTab("reports")} style={ghostBtn}>{t("التقرير الكامل", "Full report")}</button>
+        </div>
+        <div style={{ overflowX: "auto" }}>
+          <table>
+            <thead><tr><th style={th}>{t("الفرع", "Branch")}</th><th style={th}>{t("عدد عمليات الصرف", "Issue count")}</th><th style={th}>{t("إجمالي الكمية", "Total qty")}</th><th style={th}>{t("إجمالي القيمة", "Total value")}</th></tr></thead>
+            <tbody>
+              {byBranchAnalysis.map((b) => (
+                <tr key={b.branch}>
+                  <td style={{ ...td, fontWeight: 700 }}>{b.branch}</td>
+                  <td style={td}>{b.movesCount}</td>
+                  <td style={td}>{fmt(b.qtyTotal)}</td>
+                  <td style={{ ...td, fontWeight: 700, color: C.navy }}>{fmt(b.valueTotal)} {t("ر.س", "SAR")}</td>
+                </tr>
+              ))}
+              {byBranchAnalysis.length === 0 && <tr><td colSpan={4} style={{ ...td, textAlign: "center", color: "#9ca3af" }}>{t("لا يوجد فروع مسجّلة", "No branches registered")}</td></tr>}
+            </tbody>
+          </table>
         </div>
       </div>
 
@@ -2313,7 +2575,7 @@ function App() {
   if (!currentUser) return <LoginScreen users={users} onLogin={handleLogin} />;
 
   const visibleTabs = TAB_DEFS_WH.filter((tb) => {
-    if (["items", "in", "settings", "notifs", "labels", "purchase", "expiry", "suppliers", "dashboard"].includes(tb.id)) return canManageWarehouse(currentUser, whMeta);
+    if (["items", "in", "settings", "notifs", "labels", "purchase", "expiry", "suppliers", "dashboard", "equipment"].includes(tb.id)) return canManageWarehouse(currentUser, whMeta);
     return true; // out, count, reports, quickscan, branchRequest متاحة لمدير المستودع وموظفه
   });
   const effectiveTab = visibleTabs.some((tb) => tb.id === tab) ? tab : (visibleTabs[0]?.id || "out");
@@ -2350,7 +2612,7 @@ function App() {
       </div>
 
       <div style={{ padding: 20, maxWidth: 1300, margin: "0 auto" }}>
-        {effectiveTab === "dashboard" && canManageWarehouse(currentUser, whMeta) && <WarehouseDashboard lang={lang} t={t} setTab={setTab} />}
+        {effectiveTab === "dashboard" && canManageWarehouse(currentUser, whMeta) && <WarehouseDashboard lang={lang} t={t} setTab={setTab} meta={meta} />}
         {effectiveTab === "in" && canManageWarehouse(currentUser, whMeta) && <StockInTab currentUser={currentUser} lang={lang} t={t} />}
         {effectiveTab === "out" && <StockOutTab currentUser={currentUser} meta={meta} lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
         {effectiveTab === "branchRequest" && <BranchRequestTab currentUser={currentUser} meta={meta} lang={lang} t={t} isWhAdmin={canManageWarehouse(currentUser, whMeta)} />}
@@ -2360,6 +2622,7 @@ function App() {
         {effectiveTab === "labels" && canManageWarehouse(currentUser, whMeta) && <BulkLabelsTab lang={lang} t={t} />}
         {effectiveTab === "purchase" && canManageWarehouse(currentUser, whMeta) && <SuggestedPurchaseTab lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
         {effectiveTab === "expiry" && canManageWarehouse(currentUser, whMeta) && <ExpiryTab lang={lang} t={t} />}
+        {effectiveTab === "equipment" && canManageWarehouse(currentUser, whMeta) && <EquipmentTab currentUser={currentUser} meta={meta} lang={lang} t={t} />}
         {effectiveTab === "suppliers" && canManageWarehouse(currentUser, whMeta) && <SupplierStatementTab lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
         {effectiveTab === "reports" && <ReportsTab lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
         {effectiveTab === "notifs" && canManageWarehouse(currentUser, whMeta) && <WarehouseNotificationsPanel lang={lang} t={t} />}
