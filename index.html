@@ -130,6 +130,11 @@ function buildBranchGroups(branchTree) {
     id: root.id, name: root.name, branches: collectDescendantBranchNames(root.id, tree),
   })).filter((g) => g.branches.length > 0);
 }
+/* كل الكيانات (عُقد الجذر) بأسمائها فقط — حتى لو لسه ما ربطتش فروع تحتها، عشان تستخدم كتصنيف للأصناف من الأول */
+function getAllEntityNames(branchTree) {
+  const tree = branchTree || [];
+  return buildTreeChildren(tree, null).map((root) => root.name);
+}
 
 /* بيترسم options مجمّعة تحت المؤسسة (لو فيه شجرة)، أو قائمة عادية لو لسه محدش بنى الشجرة */
 function GroupedBranchOptions({ meta }) {
@@ -274,7 +279,7 @@ function branchStockDocId(branch, itemId) { return branch + "__" + itemId; }
 
 /* ============ شاشة إدارة الأصناف: إضافة/تعديل صنف بكوده وسعره وحده الأدنى — ثنائية اللغة ============ */
 function ItemsTab({ currentUser, lang, t, whMeta, meta }) {
-  const entities = buildBranchGroups(meta.branchTree).map((g) => g.name); // نفس كيانات شجرة الفروع (ratio, 24, مسكوب...)
+  const entities = getAllEntityNames(meta.branchTree); // نفس كيانات شجرة الفروع (ratio, 24, مسكوب...)
 
   const [items, setItems] = useState(null);
   const [editingId, setEditingId] = useState(null);
@@ -882,7 +887,7 @@ function ExternalPurchaseRequestTab({ currentUser, meta, lang, t, isWhAdmin }) {
   const [filterStatus, setFilterStatus] = useState("pending");
   const fileInputRef = useRef(null);
 
-  const entities = buildBranchGroups(meta.branchTree).map((g) => g.name);
+  const entities = getAllEntityNames(meta.branchTree);
 
   useEffect(() => {
     const unsub = PURCHASE_REQUESTS_COL.orderBy("createdAt", "desc").limit(100).onSnapshot(
