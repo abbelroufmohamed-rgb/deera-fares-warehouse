@@ -108,6 +108,11 @@ function getWarehouseRole(currentUser, whMeta) {
 function canManageWarehouse(currentUser, whMeta) { return getWarehouseRole(currentUser, whMeta) === "wh_admin"; }
 function canRequestForBranch(currentUser, whMeta) { const r = getWarehouseRole(currentUser, whMeta); return r === "wh_admin" || r === "wh_staff"; }
 const WAREHOUSE_ROLE_LABELS = { wh_admin: "مدير مستودع", wh_staff: "موظف مستودع" };
+/* لو الموظف مقيّد بكيان معيّن (whMeta.userEntity)، بيشوف بضاعة هذا الكيان بس — فاضي/غير موجود = يشوف كل الكيانات */
+function getUserEntityRestriction(currentUser, whMeta) {
+  const map = (whMeta && whMeta.userEntity) || {};
+  return map[currentUser.id] || "";
+}
 
 /* ============ توليد QR لصنف (يشفّر كود الصنف فقط) — بيستخدم مكتبة qrcode-generator الموثوقة، بيرسم كصورة data URL ============ */
 /* ============ ضغط صورة داخل المتصفح قبل الحفظ (نفس أسلوب تطبيق الكاشير) — بيرجع data URL جاهز للتخزين في Firestore ============ */
@@ -279,7 +284,9 @@ function branchStockDocId(branch, itemId) { return branch + "__" + itemId; }
 
 /* ============ شاشة إدارة الأصناف: إضافة/تعديل صنف بكوده وسعره وحده الأدنى — ثنائية اللغة ============ */
 function ItemsTab({ currentUser, lang, t, whMeta, meta }) {
-  const entities = getAllEntityNames(meta.branchTree); // نفس كيانات شجرة الفروع (ratio, 24, مسكوب...)
+  const restrictedEntity = getUserEntityRestriction(currentUser, whMeta);
+  const allEntities = getAllEntityNames(meta.branchTree); // نفس كيانات شجرة الفروع (ratio, 24, مسكوب...)
+  const entities = restrictedEntity ? [restrictedEntity] : allEntities; // لو الموظف مقيّد بكيان، ما يشوفش غيره خالص
 
   const [items, setItems] = useState(null);
   const [editingId, setEditingId] = useState(null);
@@ -288,10 +295,11 @@ function ItemsTab({ currentUser, lang, t, whMeta, meta }) {
   const [msg, setMsg] = useState("");
   const [showScanner, setShowScanner] = useState(false);
   const [qrItem, setQrItem] = useState(null);
+  const [historyItem, setHistoryItem] = useState(null);
   const [importing, setImporting] = useState(false);
   const [importErrors, setImportErrors] = useState([]);
   const [importSummary, setImportSummary] = useState("");
-  const [entityFilter, setEntityFilter] = useState("all");
+  const [entityFilter, setEntityFilter] = useState(restrictedEntity || "all");
   const fileInputRef = useRef(null);
 
   function emptyItem() { return { nameAr: "", nameEn: "", sku: "", unit: "قطعة", price: "", minStock: "", category: "", institution: entities[0] || "", qty: 0 }; }
@@ -527,8 +535,8 @@ function ItemsTab({ currentUser, lang, t, whMeta, meta }) {
           <div style={{ ...cardTitle, marginBottom: 0, border: "none", padding: 0 }}>📋 {t("كل الأصناف", "All items")} ({filtered.length})</div>
           <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
             {entities.length > 0 && (
-              <select value={entityFilter} onChange={(e) => setEntityFilter(e.target.value)} style={{ ...inputStyle2, maxWidth: 180 }}>
-                <option value="all">{t("كل الكيانات", "All entities")}</option>
+              <select value={entityFilter} onChange={(e) => setEntityFilter(e.target.value)} disabled={!!restrictedEntity} style={{ ...inputStyle2, maxWidth: 180 }}>
+                {!restrictedEntity && <option value="all">{t("كل الكيانات", "All entities")}</option>}
                 {entities.map((e) => <option key={e} value={e}>{e}</option>)}
               </select>
             )}
@@ -559,6 +567,7 @@ function ItemsTab({ currentUser, lang, t, whMeta, meta }) {
                     <td style={td}>{fmt((it.qty || 0) * (it.price || 0))}</td>
                     <td style={td}><span onClick={() => setQrItem(it)} style={{ cursor: "pointer", color: C.blue, fontWeight: 700 }}>{t("عرض/طباعة", "View/Print")}</span></td>
                     <td style={td}>
+                      <span onClick={() => setHistoryItem(it)} style={{ cursor: "pointer", color: C.navy, fontWeight: 700, marginLeft: 10 }}>🧾 {t("مسار الصنف", "Item trail")}</span>
                       <span onClick={() => editItem(it)} style={{ cursor: "pointer", color: C.blue, fontWeight: 700, marginLeft: 10 }}>{t("تعديل", "Edit")}</span>
                       <span onClick={() => removeItem(it)} style={{ cursor: "pointer", color: C.danger, fontWeight: 700 }}>{t("حذف", "Delete")}</span>
                     </td>
@@ -573,6 +582,7 @@ function ItemsTab({ currentUser, lang, t, whMeta, meta }) {
 
       {showScanner && <CameraScanner onScan={onScanFound} onClose={() => setShowScanner(false)} />}
       {qrItem && <ItemLabelModal item={qrItem} lang={lang} t={t} onClose={() => setQrItem(null)} />}
+      {historyItem && <ItemHistoryModal item={historyItem} lang={lang} t={t} onClose={() => setHistoryItem(null)} />}
     </div>
   );
 }
@@ -626,14 +636,25 @@ function WarehouseSettingsTab({ meta, whMeta, users, t }) {
     }
   }
 
+  async function setUserEntity(userId, entity) {
+    const current = whMeta.userEntity || {};
+    if (!entity) {
+      await WH_META_DOC.set({ userEntity: { [userId]: firebase.firestore.FieldValue.delete() } }, { merge: true });
+    } else {
+      await WH_META_DOC.set({ userEntity: { ...current, [userId]: entity } }, { merge: true });
+    }
+  }
+
+  const entities = getAllEntityNames(meta.branchTree);
+
   return (
     <div>
       <div style={cardStyle}>
         <div style={cardTitle}>👥 {t("أدوار المستودع (مستقلة عن أدوار الكاشير)", "Warehouse Roles (independent from cashier roles)")}</div>
-        <div style={{ fontSize: 12.5, color: C.muted, marginBottom: 14 }}>{t("حدّد لكل مستخدم دوره في نظام المستودع تحديدًا: مدير مستودع (تحكم كامل) أو موظف مستودع (صرف وجرد وطلبات بس، من غير إدارة أصناف أو إعدادات).", "Assign each user their role specifically in the warehouse system: warehouse manager (full control) or warehouse staff (issue, count, and requests only).")}</div>
+        <div style={{ fontSize: 12.5, color: C.muted, marginBottom: 14 }}>{t("حدّد لكل مستخدم دوره في نظام المستودع، وممكن كمان تقيّده يشوف بضاعة كيان واحد بس (مثلاً موظف يشوف \"ريشيو\" بس ومش يشوف \"24\" أو \"مسكوب\").", "Assign each user their role in the warehouse system, and optionally restrict them to seeing only one entity's stock (e.g. an employee sees only \"Ratio\", not \"24\" or \"Maskoub\").")}</div>
         <div style={{ overflowX: "auto" }}>
           <table>
-            <thead><tr><th style={th}>{t("المستخدم", "User")}</th><th style={th}>{t("دوره في الكاشير", "Cashier role")}</th><th style={th}>{t("دوره في المستودع", "Warehouse role")}</th></tr></thead>
+            <thead><tr><th style={th}>{t("المستخدم", "User")}</th><th style={th}>{t("دوره في الكاشير", "Cashier role")}</th><th style={th}>{t("دوره في المستودع", "Warehouse role")}</th><th style={th}>🏢 {t("مقيّد بكيان", "Restricted to entity")}</th></tr></thead>
             <tbody>
               {(users || []).map((u) => (
                 <tr key={u.id}>
@@ -646,9 +667,15 @@ function WarehouseSettingsTab({ meta, whMeta, users, t }) {
                       <option value="wh_staff">{t("موظف مستودع", "Warehouse staff")}</option>
                     </select>
                   </td>
+                  <td style={td}>
+                    <select value={(whMeta.userEntity || {})[u.id] || ""} onChange={(e) => setUserEntity(u.id, e.target.value)} style={{ ...inputStyle2, maxWidth: 160 }}>
+                      <option value="">{t("كل الكيانات", "All entities")}</option>
+                      {entities.map((e) => <option key={e} value={e}>{e}</option>)}
+                    </select>
+                  </td>
                 </tr>
               ))}
-              {(users || []).length === 0 && <tr><td colSpan={3} style={{ ...td, textAlign: "center", color: "#9ca3af" }}>{t("لا يوجد مستخدمين", "No users")}</td></tr>}
+              {(users || []).length === 0 && <tr><td colSpan={4} style={{ ...td, textAlign: "center", color: "#9ca3af" }}>{t("لا يوجد مستخدمين", "No users")}</td></tr>}
             </tbody>
           </table>
         </div>
@@ -1280,6 +1307,70 @@ function ItemLabelModal({ item, lang, t, onClose }) {
           <button onClick={() => window.print()} style={smallBtn}>🖨️ {t("طباعة", "Print")}</button>
           <button onClick={onClose} style={ghostBtn}>{t("إغلاق", "Close")}</button>
         </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============ مسار الصنف: كل حركاته من وارد وصادر بالترتيب الزمني — متى دخل، متى اتصرف، ولأي فرع ============ */
+function ItemHistoryModal({ item, lang, t, onClose }) {
+  const [moves, setMoves] = useState(null);
+
+  useEffect(() => {
+    const unsub = MOVES_COL.where("itemId", "==", item.id).orderBy("createdAt", "desc").limit(300).onSnapshot(
+      (snap) => setMoves(snap.docs.map((d) => ({ id: d.id, ...d.data() }))),
+      () => {
+        MOVES_COL.orderBy("createdAt", "desc").limit(3000).onSnapshot((snap) => {
+          setMoves(snap.docs.map((d) => ({ id: d.id, ...d.data() })).filter((m) => m.itemId === item.id));
+        });
+      }
+    );
+    return unsub;
+  }, [item.id]);
+
+  const totalIn = (moves || []).filter((m) => m.type === "in").reduce((s, m) => s + (Number(m.qty) || 0), 0);
+  const totalOut = (moves || []).filter((m) => m.type === "out").reduce((s, m) => s + (Number(m.qty) || 0), 0);
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(8,15,35,0.6)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }} className="no-print">
+      <div style={{ background: "#fff", borderRadius: 16, padding: 22, maxWidth: 640, width: "100%", maxHeight: "85vh", overflowY: "auto" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+          <div style={{ fontWeight: 800, fontSize: 16, color: C.navy }}>🧾 {t("مسار الصنف:", "Item trail:")} {lang === "ar" ? (item.nameAr || item.nameEn) : (item.nameEn || item.nameAr)}</div>
+          <span onClick={onClose} style={{ cursor: "pointer", fontSize: 20, color: C.muted }}>×</span>
+        </div>
+        <div style={{ display: "flex", gap: 10, marginBottom: 16, flexWrap: "wrap" }}>
+          <div style={{ flex: "1 1 140px", background: "#f0fdf4", borderRadius: 10, padding: "10px 14px" }}>
+            <div style={{ fontSize: 11.5, color: C.muted }}>{t("إجمالي الوارد", "Total received")}</div>
+            <div style={{ fontSize: 17, fontWeight: 800, color: C.success }}>+{fmt(totalIn)}</div>
+          </div>
+          <div style={{ flex: "1 1 140px", background: "#fef2f2", borderRadius: 10, padding: "10px 14px" }}>
+            <div style={{ fontSize: 11.5, color: C.muted }}>{t("إجمالي الصادر", "Total issued")}</div>
+            <div style={{ fontSize: 17, fontWeight: 800, color: C.danger }}>-{fmt(totalOut)}</div>
+          </div>
+          <div style={{ flex: "1 1 140px", background: C.blueSoft, borderRadius: 10, padding: "10px 14px" }}>
+            <div style={{ fontSize: 11.5, color: C.muted }}>{t("الرصيد الحالي", "Current balance")}</div>
+            <div style={{ fontSize: 17, fontWeight: 800, color: C.navy }}>{fmt(item.qty)}</div>
+          </div>
+        </div>
+        {moves === null ? (
+          <div style={{ color: C.muted, padding: 20, textAlign: "center" }}>...</div>
+        ) : (
+          <table>
+            <thead><tr><th style={th}>{t("التاريخ", "Date")}</th><th style={th}>{t("النوع", "Type")}</th><th style={th}>{t("الكمية", "Qty")}</th><th style={th}>{t("التفاصيل", "Details")}</th><th style={th}>{t("بواسطة", "By")}</th></tr></thead>
+            <tbody>
+              {moves.map((m) => (
+                <tr key={m.id}>
+                  <td style={td}>{m.date}</td>
+                  <td style={{ ...td, fontWeight: 700, color: m.type === "in" ? C.success : C.danger }}>{m.type === "in" ? "📥 " + t("وارد", "In") : "📤 " + t("صادر", "Out")}</td>
+                  <td style={{ ...td, fontWeight: 700 }}>{m.type === "in" ? "+" : "-"}{fmt(m.qty)}</td>
+                  <td style={td}>{m.type === "in" ? (m.supplierName || t("بدون مورد", "No supplier")) : (t("لفرع:", "To branch:") + " " + (m.branch || "—"))} {m.note ? " — " + m.note : ""}</td>
+                  <td style={td}>{m.enteredBy}</td>
+                </tr>
+              ))}
+              {moves.length === 0 && <tr><td colSpan={5} style={{ ...td, textAlign: "center", color: "#9ca3af" }}>{t("لا يوجد حركات مسجّلة لهذا الصنف بعد", "No movements recorded for this item yet")}</td></tr>}
+            </tbody>
+          </table>
+        )}
       </div>
     </div>
   );
@@ -2640,12 +2731,16 @@ const TAB_DEFS_WH = [
 ];
 
 /* ============ لوحة التحكم الرئيسية: نظرة سريعة عند الدخول — أرصدة، تنبيهات، تحليل ذكي، طلبات معلّقة ============ */
-function WarehouseDashboard({ lang, t, setTab, meta }) {
+function WarehouseDashboard({ lang, t, setTab, meta, currentUser, whMeta }) {
   const [items, setItems] = useState([]);
   const [moves, setMoves] = useState([]);
   const [pendingRequests, setPendingRequests] = useState([]);
   const [notifs, setNotifs] = useState([]);
   const [batches, setBatches] = useState([]);
+  const restrictedEntity = getUserEntityRestriction(currentUser, whMeta);
+  const [entityFilter, setEntityFilter] = useState(restrictedEntity || "all");
+
+  const entities = restrictedEntity ? [restrictedEntity] : getAllEntityNames(meta.branchTree);
 
   useEffect(() => {
     const unsub = ITEMS_COL.orderBy("nameAr").onSnapshot((snap) => setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
@@ -2668,15 +2763,20 @@ function WarehouseDashboard({ lang, t, setTab, meta }) {
     return unsub;
   }, []);
 
-  const totalValue = items.reduce((s, it) => s + (Number(it.qty) || 0) * (Number(it.price) || 0), 0);
-  const lowStockItems = items.filter((it) => it.minStock > 0 && (it.qty || 0) <= it.minStock);
-  const expiringSoon = batches.filter((b) => (b.remainingQty ?? b.qty) > 0 && Math.ceil((new Date(b.expiryDate) - new Date(todayStr())) / 86400000) <= 7);
+  // فلترة حسب الكيان المختار — لو "الكل" ما بيتفلترش خالص
+  const filteredItems = entityFilter === "all" ? items : items.filter((it) => (it.institution || "") === entityFilter);
+  const filteredItemIds = new Set(filteredItems.map((it) => it.id));
+  const filteredMoves = entityFilter === "all" ? moves : moves.filter((m) => filteredItemIds.has(m.itemId));
+
+  const totalValue = filteredItems.reduce((s, it) => s + (Number(it.qty) || 0) * (Number(it.price) || 0), 0);
+  const lowStockItems = filteredItems.filter((it) => it.minStock > 0 && (it.qty || 0) <= it.minStock);
+  const expiringSoon = batches.filter((b) => (entityFilter === "all" || filteredItemIds.has(b.itemId)) && (b.remainingQty ?? b.qty) > 0 && Math.ceil((new Date(b.expiryDate) - new Date(todayStr())) / 86400000) <= 7);
 
   // تحليل ذكي: أنماط استهلاك آخر 14 يوم
   const smartInsights = useMemo(() => {
     const list = [];
     const fromDate = new Date(Date.now() - 14 * 86400000).toISOString().slice(0, 10);
-    const recent = moves.filter((m) => m.date >= fromDate);
+    const recent = filteredMoves.filter((m) => m.date >= fromDate);
     const outByBranch = {};
     recent.filter((m) => m.type === "out").forEach((m) => { outByBranch[m.branch] = (outByBranch[m.branch] || 0) + (Number(m.qty) || 0) * (Number(m.price) || 0); });
     const branches = Object.entries(outByBranch).sort((a, b) => b[1] - a[1]);
@@ -2691,14 +2791,14 @@ function WarehouseDashboard({ lang, t, setTab, meta }) {
     if (list.length === 0) list.push({ kind: "success", text: t("كل شيء مستقر — لا توجد ملاحظات تستدعي الانتباه حاليًا 🎉", "Everything looks stable — no issues need attention right now 🎉") });
     return list;
     // eslint-disable-next-line
-  }, [moves, lowStockItems, expiringSoon, pendingRequests]);
+  }, [filteredMoves, lowStockItems, expiringSoon, pendingRequests]);
 
   // تحليل مستقل لكل فرع: كام سحب كل فرع وبأي قيمة، خلال آخر 30 يوم
   const byBranchAnalysis = useMemo(() => {
     const fromDate = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
     const map = {};
     (meta.branches || []).forEach((b) => { map[b] = { branch: b, qtyTotal: 0, valueTotal: 0, movesCount: 0 }; });
-    moves.filter((m) => m.type === "out" && m.date >= fromDate).forEach((m) => {
+    filteredMoves.filter((m) => m.type === "out" && m.date >= fromDate).forEach((m) => {
       const key = m.branch || t("غير محدد", "Unspecified");
       if (!map[key]) map[key] = { branch: key, qtyTotal: 0, valueTotal: 0, movesCount: 0 };
       map[key].qtyTotal += Number(m.qty) || 0;
@@ -2707,7 +2807,7 @@ function WarehouseDashboard({ lang, t, setTab, meta }) {
     });
     return Object.values(map).sort((a, b) => b.valueTotal - a.valueTotal);
     // eslint-disable-next-line
-  }, [moves, meta.branches]);
+  }, [filteredMoves, meta.branches]);
 
   // تجميع نفس التحليل حسب المؤسسة/النشاط الأب (شجرة الفروع) — بيوضح كام صرفت كل مؤسسة إجمالًا بغض النظر عن فروعها
   const byInstitutionAnalysis = useMemo(() => {
@@ -2735,8 +2835,21 @@ function WarehouseDashboard({ lang, t, setTab, meta }) {
   return (
     <div>
       <div style={{ ...cardStyle, background: "linear-gradient(135deg,#0f2557,#1d4ed8)", border: "none" }}>
-        <div style={{ fontSize: 20, fontWeight: 800, color: "#fff", marginBottom: 4 }}>📦 {t("لوحة تحكم المستودع", "Warehouse Dashboard")}</div>
-        <div style={{ fontSize: 13, color: "#c7d5f5" }}>{t("نظرة سريعة على وضع المخزون النهاردة", "A quick look at today's inventory status")}</div>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 12 }}>
+          <div>
+            <div style={{ fontSize: 20, fontWeight: 800, color: "#fff", marginBottom: 4 }}>📦 {t("لوحة تحكم المستودع", "Warehouse Dashboard")}</div>
+            <div style={{ fontSize: 13, color: "#c7d5f5" }}>{t("نظرة سريعة على وضع المخزون النهاردة", "A quick look at today's inventory status")}</div>
+          </div>
+          {entities.length > 0 && (
+            <div>
+              <label style={{ fontSize: 11.5, color: "#c7d5f5", display: "block", marginBottom: 4 }}>🏢 {t("فلترة حسب الكيان", "Filter by entity")}</label>
+              <select value={entityFilter} onChange={(e) => setEntityFilter(e.target.value)} disabled={!!restrictedEntity} style={{ ...inputStyle2, minWidth: 160 }}>
+                {!restrictedEntity && <option value="all">{t("كل الكيانات", "All entities")}</option>}
+                {entities.map((e) => <option key={e} value={e}>{e}</option>)}
+              </select>
+            </div>
+          )}
+        </div>
       </div>
 
       <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 18 }}>
@@ -2922,7 +3035,7 @@ function App() {
       </div>
 
       <div style={{ padding: 20, maxWidth: 1300, margin: "0 auto" }}>
-        {effectiveTab === "dashboard" && canManageWarehouse(currentUser, whMeta) && <WarehouseDashboard lang={lang} t={t} setTab={setTab} meta={meta} />}
+        {effectiveTab === "dashboard" && canManageWarehouse(currentUser, whMeta) && <WarehouseDashboard lang={lang} t={t} setTab={setTab} meta={meta} currentUser={currentUser} whMeta={whMeta} />}
         {effectiveTab === "in" && canManageWarehouse(currentUser, whMeta) && <StockInTab currentUser={currentUser} lang={lang} t={t} />}
         {effectiveTab === "out" && <StockOutTab currentUser={currentUser} meta={meta} lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
         {effectiveTab === "branchRequest" && <BranchRequestTab currentUser={currentUser} meta={meta} lang={lang} t={t} isWhAdmin={canManageWarehouse(currentUser, whMeta)} />}
