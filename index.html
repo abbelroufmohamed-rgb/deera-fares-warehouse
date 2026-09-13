@@ -299,6 +299,9 @@ function ItemsTab({ currentUser, lang, t, whMeta, meta }) {
   const [importing, setImporting] = useState(false);
   const [importErrors, setImportErrors] = useState([]);
   const [importSummary, setImportSummary] = useState("");
+  const [importDefaultEntity, setImportDefaultEntity] = useState("");
+  const [bulkAssignTarget, setBulkAssignTarget] = useState("");
+  const [bulkAssigning, setBulkAssigning] = useState(false);
   const [entityFilter, setEntityFilter] = useState(restrictedEntity || "all");
   const fileInputRef = useRef(null);
 
@@ -322,6 +325,7 @@ function ItemsTab({ currentUser, lang, t, whMeta, meta }) {
     { key: "price", labelAr: "السعر", labelEn: "Price" },
     { key: "minStock", labelAr: "الحد الأدنى", labelEn: "Min stock" },
     { key: "category", labelAr: "الفئة", labelEn: "Category" },
+    { key: "institution", labelAr: "الكيان (اختياري — لو فاضي هياخد الكيان الافتراضي المختار وقت الرفع)", labelEn: "Entity (optional — if empty, uses the default entity chosen at upload time)" },
     { key: "qty", labelAr: "الرصيد الحالي (للعرض فقط، متغيّرش)", labelEn: "Current qty (read-only, don't edit)" },
   ];
 
@@ -369,16 +373,19 @@ function ItemsTab({ currentUser, lang, t, whMeta, meta }) {
         const price = Number(r[4]) || 0;
         const minStock = Number(r[5]) || 0;
         const category = String(r[6] || "").trim();
+        // العمود الثامن (اختياري): كيان لكل صنف لوحده — لو فاضي، بناخد الكيان الافتراضي المختار فوق الرفع
+        const rowInstitution = String(r[7] || "").trim();
+        const institution = rowInstitution || importDefaultEntity;
 
         if (!nameAr && !nameEn) { errors.push({ row: rowNum, reason: t("الصف فاضي من اسم الصنف (عربي أو إنجليزي)", "Row is missing item name (Arabic or English)") }); continue; }
         try {
           const existing = sku ? (items || []).find((it) => it.sku === sku) : null;
           if (existing) {
-            await ITEMS_COL.doc(existing.id).update({ nameAr, nameEn, unit, price, minStock, category });
+            await ITEMS_COL.doc(existing.id).update({ nameAr, nameEn, unit, price, minStock, category, institution });
             updated++;
           } else {
             await ITEMS_COL.add({
-              nameAr, nameEn, sku: sku || uid().toUpperCase(), unit, price, minStock, category,
+              nameAr, nameEn, sku: sku || uid().toUpperCase(), unit, price, minStock, category, institution,
               qty: 0, institutionId: DEFAULT_INSTITUTION_ID, createdAt: firebase.firestore.FieldValue.serverTimestamp(),
             });
             added++;
@@ -393,6 +400,27 @@ function ItemsTab({ currentUser, lang, t, whMeta, meta }) {
       setImportErrors([{ row: "—", reason: t("تعذر قراءة الملف: ", "Could not read file: ") + e.message }]);
     }
     setImporting(false);
+  }
+
+  async function bulkAssignEntity() {
+    if (!bulkAssignTarget) { setMsg(t("اختر الكيان أولًا", "Choose the entity first")); return; }
+    const targetItems = (items || []).filter((it) => !it.institution);
+    if (targetItems.length === 0) return;
+    if (!confirm(t(`هل تريد تعيين "${bulkAssignTarget}" كيانًا لـ ${targetItems.length} صنف بدون كيان محدد؟`, `Assign "${bulkAssignTarget}" as the entity for ${targetItems.length} item(s) with no entity set?`))) return;
+    setBulkAssigning(true); setMsg("");
+    try {
+      // Firestore batch محدود بـ500 عملية، فبنقسّم على دفعات لو العدد أكبر
+      const chunkSize = 450;
+      for (let i = 0; i < targetItems.length; i += chunkSize) {
+        const chunk = targetItems.slice(i, i + chunkSize);
+        const batch = db.batch();
+        chunk.forEach((it) => batch.update(ITEMS_COL.doc(it.id), { institution: bulkAssignTarget }));
+        await batch.commit();
+      }
+      setMsg("✅ " + t(`تم تعيين الكيان لـ ${targetItems.length} صنف بنجاح`, `Entity assigned to ${targetItems.length} item(s) successfully`));
+      setBulkAssignTarget("");
+    } catch (e) { setMsg("Error: " + e.message); }
+    setBulkAssigning(false);
   }
 
   async function save() {
@@ -503,6 +531,17 @@ function ItemsTab({ currentUser, lang, t, whMeta, meta }) {
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
           <button onClick={downloadTemplate} style={ghostBtn}>📄 {t("تحميل نموذج فاضي", "Download empty template")}</button>
           <button onClick={exportExcel} style={ghostBtn}>⬇️ {t("تصدير كل الأصناف الحالية", "Export all current items")}</button>
+        </div>
+        {entities.length > 0 && (
+          <div style={{ marginTop: 12, background: C.blueSoft, borderRadius: 10, padding: "10px 14px" }}>
+            <label style={smallLabel}>🏢 {t("الكيان الافتراضي لهذا الرفع (لو كل الأصناف في الملف لنفس الكيان)", "Default entity for this upload (if all items in the file belong to the same entity)")}</label>
+            <select value={importDefaultEntity} onChange={(e) => setImportDefaultEntity(e.target.value)} style={{ ...inputStyle2, maxWidth: 260 }}>
+              <option value="">{t("بدون كيان افتراضي", "No default entity")}</option>
+              {entities.map((e) => <option key={e} value={e}>{e}</option>)}
+            </select>
+          </div>
+        )}
+        <div style={{ marginTop: 12 }}>
           <input type="file" accept=".xlsx,.xls" ref={fileInputRef} style={{ display: "none" }}
             onChange={(e) => { if (e.target.files[0]) importExcel(e.target.files[0]); e.target.value = ""; }} />
           <button onClick={() => fileInputRef.current?.click()} disabled={importing} style={smallBtn}>
@@ -529,6 +568,24 @@ function ItemsTab({ currentUser, lang, t, whMeta, meta }) {
           </div>
         )}
       </div>
+
+      {entities.length > 0 && (
+        <div style={cardStyle}>
+          <div style={cardTitle}>🏢 {t("تعيين كيان بالجملة", "Bulk Assign Entity")}</div>
+          <div style={{ fontSize: 12.5, color: C.muted, marginBottom: 14 }}>
+            {t("رفعت أصناف قبل ما تحدد لها كيان؟ اختار الكيان هنا وهيتطبّق مرة واحدة على كل الأصناف اللي لسه من غير كيان، من غير ما تحتاج تعدّل كل صنف لوحده أو ترفع الملف تاني.", "Uploaded items before assigning them an entity? Pick the entity here and it'll apply at once to every item that still has no entity — no need to edit each one or re-upload the file.")}
+          </div>
+          <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+            <select value={bulkAssignTarget} onChange={(e) => setBulkAssignTarget(e.target.value)} style={{ ...inputStyle2, maxWidth: 220 }}>
+              <option value="">{t("اختر الكيان", "Choose entity")}</option>
+              {entities.map((e) => <option key={e} value={e}>{e}</option>)}
+            </select>
+            <button onClick={bulkAssignEntity} disabled={bulkAssigning || !bulkAssignTarget} style={smallBtn}>
+              {bulkAssigning ? t("جارِ التطبيق...", "Applying...") : t(`تطبيق على كل الأصناف بدون كيان (${(items || []).filter((it) => !it.institution).length})`, `Apply to all items without an entity (${(items || []).filter((it) => !it.institution).length})`)}
+            </button>
+          </div>
+        </div>
+      )}
 
       <div style={cardStyle}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14, flexWrap: "wrap", gap: 10 }}>
