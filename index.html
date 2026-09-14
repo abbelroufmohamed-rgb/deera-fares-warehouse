@@ -2248,6 +2248,143 @@ function BranchRequestVoucher({ req, lang, t, onClose }) {
   );
 }
 
+/* ============ جرد المستودع الرئيسي: مقارنة الرصيد الفعلي مقابل رصيد النظام لكل صنف، وتصحيح الرصيد تلقائيًا ============ */
+function MainWarehouseCountTab({ currentUser, meta, lang, t }) {
+  const [items, setItems] = useState(null);
+  const [counted, setCounted] = useState({}); // { itemId: countedQty }
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [history, setHistory] = useState([]);
+  const [entityFilter, setEntityFilter] = useState("all");
+  const [search, setSearch] = useState("");
+
+  const entities = getAllEntityNames(meta.branchTree);
+  const MAIN_WH_LABEL = t("المستودع الرئيسي", "Main Warehouse");
+
+  useEffect(() => {
+    const unsub = ITEMS_COL.orderBy("nameAr").onSnapshot((snap) => setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
+    return unsub;
+  }, []);
+  useEffect(() => {
+    const unsub = COUNTS_COL.orderBy("createdAt", "desc").limit(30).onSnapshot(
+      (snap) => setHistory(snap.docs.map((d) => ({ id: d.id, ...d.data() })).filter((c) => c.branch === MAIN_WH_LABEL)),
+      () => {}
+    );
+    return unsub;
+    // eslint-disable-next-line
+  }, []);
+
+  function setCountedQty(itemId, val) { setCounted((c) => ({ ...c, [itemId]: val })); }
+
+  const filteredItems = (items || []).filter((it) => {
+    if (entityFilter !== "all" && (it.institution || "") !== entityFilter) return false;
+    const s = search.trim().toLowerCase();
+    if (!s) return true;
+    return (it.nameAr || "").toLowerCase().includes(s) || (it.nameEn || "").toLowerCase().includes(s) || (it.sku || "").toLowerCase().includes(s);
+  });
+
+  async function submitCounts() {
+    const toSubmit = filteredItems.filter((it) => counted[it.id] !== undefined && counted[it.id] !== "");
+    if (toSubmit.length === 0) { setMsg(t("أدخل كمية فعلية لصنف واحد على الأقل", "Enter a counted quantity for at least one item")); return; }
+    setSaving(true); setMsg("");
+    try {
+      const shortages = [];
+      for (const it of toSubmit) {
+        const countedQty = Number(counted[it.id]) || 0;
+        const systemQty = Number(it.qty) || 0;
+        const diff = countedQty - systemQty;
+        await COUNTS_COL.add({
+          branch: MAIN_WH_LABEL, itemId: it.id, itemName: it.nameAr, systemQty, countedQty, diff, date: todayStr(),
+          countedBy: currentUser.name, institutionId: DEFAULT_INSTITUTION_ID, createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+        });
+        await ITEMS_COL.doc(it.id).update({ qty: countedQty }); // الجرد بيصحّح رصيد المستودع الرئيسي مباشرة
+        if (countedQty <= 0 || diff < -0.009) shortages.push({ itemName: it.nameAr, countedQty, diff });
+      }
+      if (shortages.length > 0) {
+        await WH_NOTIF_COL.add({
+          type: "shortage", branch: MAIN_WH_LABEL, items: shortages, date: todayStr(), createdBy: currentUser.name,
+          institutionId: DEFAULT_INSTITUTION_ID, createdAt: firebase.firestore.FieldValue.serverTimestamp(), readBy: [],
+        });
+      }
+      setCounted({});
+      setMsg("✅ " + t(`تم حفظ جرد المستودع الرئيسي (${toSubmit.length} صنف)` + (shortages.length ? ` — ⚠️ ${shortages.length} صنف فيه نقص وتم إرسال إشعار` : ""), `Main warehouse count saved (${toSubmit.length} items)` + (shortages.length ? ` — ⚠️ ${shortages.length} shortage(s) notified` : "")));
+    } catch (e) { setMsg("Error: " + e.message); }
+    setSaving(false);
+  }
+
+  if (items === null) return <div style={{ color: C.muted, padding: 20 }}>...</div>;
+
+  return (
+    <div>
+      <div style={cardStyle}>
+        <div style={cardTitle}>🏢🧮 {t("جرد المستودع الرئيسي", "Main Warehouse Count")}</div>
+        <div style={{ fontSize: 12.5, color: C.muted, marginBottom: 14 }}>{t("سجّل الكمية الفعلية الموجودة بالمستودع الرئيسي نفسه لكل صنف (مش فروع). أي فرق عن رصيد النظام بيتصحّح تلقائيًا، وأي نقص بيتبعت كإشعار.", "Record the actual quantity physically present at the main warehouse itself for each item (not branches). Any difference from the system balance is corrected automatically, and shortages trigger a notification.")}</div>
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 14 }}>
+          {entities.length > 0 && (
+            <div>
+              <label style={smallLabel}>🏢 {t("فلترة حسب الكيان", "Filter by entity")}</label>
+              <select value={entityFilter} onChange={(e) => setEntityFilter(e.target.value)} style={{ ...inputStyle2, maxWidth: 200 }}>
+                <option value="all">{t("كل الكيانات", "All entities")}</option>
+                {entities.map((e) => <option key={e} value={e}>{e}</option>)}
+              </select>
+            </div>
+          )}
+          <div style={{ flex: "1 1 200px" }}>
+            <label style={smallLabel}>{t("بحث", "Search")}</label>
+            <input value={search} onChange={(e) => setSearch(e.target.value)} style={inputStyle2} placeholder={t("بحث بالاسم أو الكود...", "Search name or code...")} />
+          </div>
+        </div>
+        <div style={{ overflowX: "auto" }}>
+          <table>
+            <thead><tr><th style={th}>{t("الصنف", "Item")}</th><th style={th}>🏢 {t("الكيان", "Entity")}</th><th style={th}>{t("رصيد النظام", "System qty")}</th><th style={th}>{t("الكمية الفعلية المجرودة", "Actual counted qty")}</th><th style={th}>{t("الفرق", "Diff")}</th></tr></thead>
+            <tbody>
+              {filteredItems.map((it) => {
+                const c = counted[it.id];
+                const diff = c !== undefined && c !== "" ? Number(c) - Number(it.qty) : null;
+                return (
+                  <tr key={it.id}>
+                    <td style={{ ...td, fontWeight: 700 }}>{lang === "ar" ? (it.nameAr || it.nameEn) : (it.nameEn || it.nameAr)}</td>
+                    <td style={td}>{it.institution || "—"}</td>
+                    <td style={td}>{fmt(it.qty)} {it.unit}</td>
+                    <td style={td}><input type="number" step="0.01" value={c || ""} onChange={(e) => setCountedQty(it.id, e.target.value)} style={{ ...inputStyle2, width: 110 }} /></td>
+                    <td style={{ ...td, fontWeight: 700, color: diff === null ? C.muted : diff < 0 ? C.danger : diff > 0 ? C.success : C.muted }}>{diff === null ? "—" : (diff > 0 ? "+" : "") + fmt(diff)}</td>
+                  </tr>
+                );
+              })}
+              {filteredItems.length === 0 && <tr><td colSpan={5} style={{ ...td, textAlign: "center", color: "#9ca3af" }}>{t("لا يوجد أصناف", "No items")}</td></tr>}
+            </tbody>
+          </table>
+        </div>
+        {filteredItems.length > 0 && (
+          <div style={{ marginTop: 14 }}>
+            <button onClick={submitCounts} disabled={saving} style={smallBtn}>{saving ? t("جارِ الحفظ...", "Saving...") : "💾 " + t("حفظ الجرد", "Save count")}</button>
+          </div>
+        )}
+        {msg && <div style={{ marginTop: 10, fontSize: 13.5, color: msg.startsWith("✅") ? C.success : C.danger }}>{msg}</div>}
+      </div>
+
+      <div style={cardStyle}>
+        <div style={cardTitle}>🕒 {t("آخر عمليات جرد المستودع الرئيسي", "Recent main warehouse counts")}</div>
+        <div style={{ overflowX: "auto" }}>
+          <table>
+            <thead><tr><th style={th}>{t("التاريخ", "Date")}</th><th style={th}>{t("الصنف", "Item")}</th><th style={th}>{t("رصيد النظام", "System")}</th><th style={th}>{t("الفعلي", "Counted")}</th><th style={th}>{t("الفرق", "Diff")}</th><th style={th}>{t("بواسطة", "By")}</th></tr></thead>
+            <tbody>
+              {history.map((h) => (
+                <tr key={h.id}>
+                  <td style={td}>{h.date}</td><td style={td}>{h.itemName}</td><td style={td}>{fmt(h.systemQty)}</td><td style={td}>{fmt(h.countedQty)}</td>
+                  <td style={{ ...td, fontWeight: 700, color: h.diff < 0 ? C.danger : h.diff > 0 ? C.success : C.muted }}>{h.diff > 0 ? "+" : ""}{fmt(h.diff)}</td>
+                  <td style={td}>{h.countedBy}</td>
+                </tr>
+              ))}
+              {history.length === 0 && <tr><td colSpan={6} style={{ ...td, textAlign: "center", color: "#9ca3af" }}>{t("لا يوجد جرد سابق", "No previous counts")}</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function BranchCountTab({ currentUser, meta, lang, t }) {
   const [branch, setBranch] = useState("");
   const [branchStock, setBranchStock] = useState([]);
@@ -2774,6 +2911,7 @@ const TAB_DEFS_WH = [
   { id: "out", labelAr: "صرف للفروع", labelEn: "Issue to Branch" },
   { id: "branchRequest", labelAr: "طلب من المستودع", labelEn: "Request from Warehouse" },
   { id: "quickscan", labelAr: "⚡ مسح سريع", labelEn: "⚡ Quick Scan" },
+  { id: "mainCount", labelAr: "🏢🧮 جرد المستودع الرئيسي", labelEn: "🏢🧮 Main Warehouse Count" },
   { id: "count", labelAr: "جرد الفروع", labelEn: "Branch Count" },
   { id: "items", labelAr: "الأصناف", labelEn: "Items" },
   { id: "labels", labelAr: "طباعة ملصقات", labelEn: "Print Labels" },
@@ -3055,7 +3193,7 @@ function App() {
   if (!currentUser) return <LoginScreen users={users} onLogin={handleLogin} />;
 
   const visibleTabs = TAB_DEFS_WH.filter((tb) => {
-    if (["items", "in", "settings", "notifs", "labels", "purchase", "expiry", "suppliers", "dashboard", "equipment"].includes(tb.id)) return canManageWarehouse(currentUser, whMeta);
+    if (["items", "in", "settings", "notifs", "labels", "purchase", "expiry", "suppliers", "dashboard", "equipment", "mainCount"].includes(tb.id)) return canManageWarehouse(currentUser, whMeta);
     return true; // out, count, reports, quickscan, branchRequest متاحة لمدير المستودع وموظفه
   });
   const effectiveTab = visibleTabs.some((tb) => tb.id === tab) ? tab : (visibleTabs[0]?.id || "out");
@@ -3097,6 +3235,7 @@ function App() {
         {effectiveTab === "out" && <StockOutTab currentUser={currentUser} meta={meta} lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
         {effectiveTab === "branchRequest" && <BranchRequestTab currentUser={currentUser} meta={meta} lang={lang} t={t} isWhAdmin={canManageWarehouse(currentUser, whMeta)} />}
         {effectiveTab === "quickscan" && <QuickScanTab currentUser={currentUser} meta={meta} lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
+        {effectiveTab === "mainCount" && canManageWarehouse(currentUser, whMeta) && <MainWarehouseCountTab currentUser={currentUser} meta={meta} lang={lang} t={t} />}
         {effectiveTab === "count" && <BranchCountTab currentUser={currentUser} meta={meta} lang={lang} t={t} />}
         {effectiveTab === "items" && canManageWarehouse(currentUser, whMeta) && <ItemsTab currentUser={currentUser} lang={lang} t={t} whMeta={whMeta} meta={meta} />}
         {effectiveTab === "labels" && canManageWarehouse(currentUser, whMeta) && <BulkLabelsTab lang={lang} t={t} />}
