@@ -303,6 +303,7 @@ function ItemsTab({ currentUser, lang, t, whMeta, meta }) {
   const [bulkAssignTarget, setBulkAssignTarget] = useState("");
   const [bulkAssigning, setBulkAssigning] = useState(false);
   const [entityFilter, setEntityFilter] = useState(restrictedEntity || "all");
+  const [hideZeroStock, setHideZeroStock] = useState(false);
   const fileInputRef = useRef(null);
 
   function emptyItem() { return { nameAr: "", nameEn: "", sku: "", unit: "قطعة", price: "", minStock: "", category: "", institution: entities[0] || "", qty: 0 }; }
@@ -456,12 +457,20 @@ function ItemsTab({ currentUser, lang, t, whMeta, meta }) {
     await ITEMS_COL.doc(it.id).delete();
   }
 
-  const filtered = (items || []).filter((it) => {
+  const filteredRaw = (items || []).filter((it) => {
     if (entityFilter !== "all" && (it.institution || "") !== entityFilter) return false;
     const s = search.trim().toLowerCase();
     if (!s) return true;
     return (it.nameAr || "").toLowerCase().includes(s) || (it.nameEn || "").toLowerCase().includes(s) || (it.sku || "").toLowerCase().includes(s);
   });
+  // المتوفر (رصيد أكبر من صفر) يظهر الأول، والصفري بعده في الآخر
+  const sortedByStock = [...filteredRaw].sort((a, b) => {
+    const aHas = (Number(a.qty) || 0) > 0.009, bHas = (Number(b.qty) || 0) > 0.009;
+    if (aHas !== bHas) return aHas ? -1 : 1;
+    return 0;
+  });
+  const zeroStockCount = sortedByStock.filter((it) => !((Number(it.qty) || 0) > 0.009)).length;
+  const filtered = hideZeroStock ? sortedByStock.filter((it) => (Number(it.qty) || 0) > 0.009) : sortedByStock;
 
   function onScanFound(code) {
     setShowScanner(false);
@@ -588,7 +597,7 @@ function ItemsTab({ currentUser, lang, t, whMeta, meta }) {
       )}
 
       <div style={cardStyle}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14, flexWrap: "wrap", gap: 10 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10, flexWrap: "wrap", gap: 10 }}>
           <div style={{ ...cardTitle, marginBottom: 0, border: "none", padding: 0 }}>📋 {t("كل الأصناف", "All items")} ({filtered.length})</div>
           <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
             {entities.length > 0 && (
@@ -600,6 +609,10 @@ function ItemsTab({ currentUser, lang, t, whMeta, meta }) {
             <input value={search} onChange={(e) => setSearch(e.target.value)} style={{ ...inputStyle2, maxWidth: 240 }} placeholder={t("بحث بالاسم أو الكود...", "Search name or code...")} />
           </div>
         </div>
+        <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12.5, color: C.muted, marginBottom: 14, cursor: "pointer" }}>
+          <input type="checkbox" checked={hideZeroStock} onChange={(e) => setHideZeroStock(e.target.checked)} />
+          {t(`إخفاء الأصناف اللي رصيدها صفر (${zeroStockCount})`, `Hide out-of-stock items (${zeroStockCount})`)}
+        </label>
         <div style={{ overflowX: "auto" }}>
           <table>
             <thead><tr>
@@ -1287,6 +1300,134 @@ function EquipmentTab({ currentUser, meta, lang, t }) {
           {equipment.length === 0 && <div style={{ color: "#9ca3af", fontSize: 13, textAlign: "center" }}>{t("لا يوجد معدات مسجّلة", "No equipment registered")}</div>}
         </div>
       </div>
+    </div>
+  );
+}
+
+/* ============ كشف حساب فرع: كل حركاته مع المستودع الرئيسي — كام استلم، من كام صنف، والرصيد الحالي عنده ============ */
+function BranchStatementTab({ meta, lang, t, institutionName }) {
+  const [moves, setMoves] = useState([]);
+  const [branchStock, setBranchStock] = useState([]);
+  const [counts, setCounts] = useState([]);
+  const [selectedBranch, setSelectedBranch] = useState("");
+  const [fromDate, setFromDate] = useState(new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().slice(0, 10));
+  const [toDate, setToDate] = useState(todayStr());
+
+  useEffect(() => { if (!selectedBranch && meta.branches?.length) setSelectedBranch(meta.branches[0]); }, [meta.branches]);
+  useEffect(() => {
+    const unsub = MOVES_COL.where("type", "==", "out").orderBy("createdAt", "desc").limit(3000).onSnapshot(
+      (snap) => setMoves(snap.docs.map((d) => ({ id: d.id, ...d.data() }))),
+      () => { MOVES_COL.orderBy("createdAt", "desc").limit(4000).onSnapshot((snap) => setMoves(snap.docs.map((d) => ({ id: d.id, ...d.data() })).filter((m) => m.type === "out"))); }
+    );
+    return unsub;
+  }, []);
+  useEffect(() => {
+    const unsub = BRANCH_STOCK_COL.onSnapshot((snap) => setBranchStock(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
+    return unsub;
+  }, []);
+  useEffect(() => {
+    const unsub = COUNTS_COL.orderBy("createdAt", "desc").limit(100).onSnapshot((snap) => setCounts(snap.docs.map((d) => ({ id: d.id, ...d.data() }))), () => {});
+    return unsub;
+  }, []);
+
+  const branchMoves = moves.filter((m) => m.branch === selectedBranch).sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+  const rangeMoves = branchMoves.filter((m) => m.date >= fromDate && m.date <= toDate);
+  const branchCurrentStock = branchStock.filter((b) => b.branch === selectedBranch && (Number(b.qty) || 0) > 0.009);
+  const branchCounts = counts.filter((c) => c.branch === selectedBranch).sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+
+  const totalReceivedValue = branchMoves.reduce((s, m) => s + (Number(m.qty) || 0) * (Number(m.price) || 0), 0);
+  const rangeReceivedValue = rangeMoves.reduce((s, m) => s + (Number(m.qty) || 0) * (Number(m.price) || 0), 0);
+  const currentStockValue = branchCurrentStock.reduce((s, b) => s + (Number(b.qty) || 0) * (b.price || 0), 0);
+
+  function doPrint() { window.print(); }
+
+  return (
+    <div>
+      <div style={cardStyle} className="no-print">
+        <div style={cardTitle}>📋 {t("كشف حساب فرع مع المستودع الرئيسي", "Branch Statement with Main Warehouse")}</div>
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+          <div>
+            <label style={smallLabel}>{t("الفرع", "Branch")}</label>
+            <select value={selectedBranch} onChange={(e) => setSelectedBranch(e.target.value)} style={{ ...inputStyle2, maxWidth: 240 }}>
+              <GroupedBranchOptions meta={meta} />
+            </select>
+          </div>
+          <div><label style={smallLabel}>{t("من تاريخ", "From")}</label><input type="date" value={fromDate} onChange={(e) => setFromDate(e.target.value)} style={inputStyle2} /></div>
+          <div><label style={smallLabel}>{t("إلى تاريخ", "To")}</label><input type="date" value={toDate} onChange={(e) => setToDate(e.target.value)} style={inputStyle2} /></div>
+        </div>
+      </div>
+
+      {selectedBranch && (
+        <div className="print-area">
+          <div className="print-only-header"><h2>{institutionName}</h2><div>{t("كشف حساب فرع", "Branch Statement")} — {selectedBranch}</div></div>
+
+          <div style={cardStyle}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }} className="no-print">
+              <div style={cardTitle}>{selectedBranch}</div>
+              <button onClick={doPrint} style={ghostBtn}>🖨️ {t("طباعة الكشف", "Print statement")}</button>
+            </div>
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+              <div style={{ flex: "1 1 200px", background: "linear-gradient(135deg,#0f2557,#1d4ed8)", borderRadius: 10, padding: "12px 14px" }}>
+                <div style={{ fontSize: 12, color: "#dbe6ff" }}>{t("إجمالي المستلم كل الوقت", "Total received all-time")}</div>
+                <div style={{ fontSize: 19, fontWeight: 800, color: "#fff" }}>{fmt(totalReceivedValue)}</div>
+              </div>
+              <div style={{ flex: "1 1 200px", background: C.blueSoft, borderRadius: 10, padding: "12px 14px" }}>
+                <div style={{ fontSize: 12, color: C.muted }}>{t("المستلم في الفترة المحددة", "Received in selected period")}</div>
+                <div style={{ fontSize: 19, fontWeight: 800, color: C.navy }}>{fmt(rangeReceivedValue)}</div>
+              </div>
+              <div style={{ flex: "1 1 200px", background: C.blueSoft, borderRadius: 10, padding: "12px 14px" }}>
+                <div style={{ fontSize: 12, color: C.muted }}>{t("قيمة الرصيد الحالي عنده", "Current stock value there")}</div>
+                <div style={{ fontSize: 19, fontWeight: 800, color: C.navy }}>{fmt(currentStockValue)}</div>
+              </div>
+            </div>
+          </div>
+
+          <div style={cardStyle}>
+            <div style={cardTitle}>📦 {t("الرصيد الحالي عند هذا الفرع (كل الأصناف)", "Current stock at this branch (all items)")}</div>
+            <table>
+              <thead><tr><th style={th}>{t("الصنف", "Item")}</th><th style={th}>{t("الكمية الحالية", "Current qty")}</th></tr></thead>
+              <tbody>
+                {branchCurrentStock.map((b) => <tr key={b.id}><td style={{ ...td, fontWeight: 700 }}>{b.itemName}</td><td style={td}>{fmt(b.qty)}</td></tr>)}
+                {branchCurrentStock.length === 0 && <tr><td colSpan={2} style={{ ...td, textAlign: "center", color: "#9ca3af" }}>{t("لا يوجد رصيد حاليًا", "No current stock")}</td></tr>}
+              </tbody>
+            </table>
+          </div>
+
+          <div style={cardStyle}>
+            <div style={cardTitle}>🧾 {t("كل ما استلمه هذا الفرع من المستودع الرئيسي (في الفترة المحددة)", "Everything this branch received from the main warehouse (selected period)")}</div>
+            <table>
+              <thead><tr><th style={th}>{t("التاريخ", "Date")}</th><th style={th}>{t("الصنف", "Item")}</th><th style={th}>{t("الكمية", "Qty")}</th><th style={th}>{t("القيمة", "Value")}</th><th style={th}>{t("بواسطة", "By")}</th></tr></thead>
+              <tbody>
+                {rangeMoves.map((m) => (
+                  <tr key={m.id}>
+                    <td style={td}>{m.date}</td><td style={td}>{lang === "ar" ? m.itemName : (m.itemNameEn || m.itemName)}</td>
+                    <td style={td}>{fmt(m.qty)} {m.unit}</td><td style={{ ...td, fontWeight: 700 }}>{fmt((Number(m.qty) || 0) * (Number(m.price) || 0))}</td>
+                    <td style={td}>{m.enteredBy}</td>
+                  </tr>
+                ))}
+                {rangeMoves.length === 0 && <tr><td colSpan={5} style={{ ...td, textAlign: "center", color: "#9ca3af" }}>{t("لا يوجد حركات في هذه الفترة", "No movements in this period")}</td></tr>}
+              </tbody>
+            </table>
+          </div>
+
+          {branchCounts.length > 0 && (
+            <div style={cardStyle} className="no-print">
+              <div style={cardTitle}>🧮 {t("آخر عمليات الجرد لهذا الفرع", "Recent counts for this branch")}</div>
+              <table>
+                <thead><tr><th style={th}>{t("التاريخ", "Date")}</th><th style={th}>{t("الصنف", "Item")}</th><th style={th}>{t("متوقع", "Expected")}</th><th style={th}>{t("فعلي", "Counted")}</th><th style={th}>{t("الفرق", "Diff")}</th></tr></thead>
+                <tbody>
+                  {branchCounts.slice(0, 20).map((c) => (
+                    <tr key={c.id}>
+                      <td style={td}>{c.date}</td><td style={td}>{c.itemName}</td><td style={td}>{fmt(c.systemQty)}</td><td style={td}>{fmt(c.countedQty)}</td>
+                      <td style={{ ...td, fontWeight: 700, color: c.diff < 0 ? C.danger : c.diff > 0 ? C.success : C.muted }}>{c.diff > 0 ? "+" : ""}{fmt(c.diff)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -2920,6 +3061,7 @@ const TAB_DEFS_WH = [
   { id: "equipment", labelAr: "🔧 المعدات والصيانة", labelEn: "🔧 Equipment & Maintenance" },
   { id: "externalPurchase", labelAr: "🛒 طلب شراء خارجي", labelEn: "🛒 External Purchase" },
   { id: "suppliers", labelAr: "كشف حساب مورد", labelEn: "Supplier Statement" },
+  { id: "branchStatement", labelAr: "📋 كشف حساب فرع", labelEn: "📋 Branch Statement" },
   { id: "reports", labelAr: "التقارير", labelEn: "Reports" },
   { id: "notifs", labelAr: "الإشعارات", labelEn: "Notifications" },
   { id: "settings", labelAr: "الإعدادات", labelEn: "Settings" },
@@ -3193,7 +3335,7 @@ function App() {
   if (!currentUser) return <LoginScreen users={users} onLogin={handleLogin} />;
 
   const visibleTabs = TAB_DEFS_WH.filter((tb) => {
-    if (["items", "in", "settings", "notifs", "labels", "purchase", "expiry", "suppliers", "dashboard", "equipment", "mainCount"].includes(tb.id)) return canManageWarehouse(currentUser, whMeta);
+    if (["items", "in", "settings", "notifs", "labels", "purchase", "expiry", "suppliers", "dashboard", "equipment", "mainCount", "branchStatement"].includes(tb.id)) return canManageWarehouse(currentUser, whMeta);
     return true; // out, count, reports, quickscan, branchRequest متاحة لمدير المستودع وموظفه
   });
   const effectiveTab = visibleTabs.some((tb) => tb.id === tab) ? tab : (visibleTabs[0]?.id || "out");
@@ -3244,6 +3386,7 @@ function App() {
         {effectiveTab === "equipment" && canManageWarehouse(currentUser, whMeta) && <EquipmentTab currentUser={currentUser} meta={meta} lang={lang} t={t} />}
         {effectiveTab === "externalPurchase" && <ExternalPurchaseRequestTab currentUser={currentUser} meta={meta} lang={lang} t={t} isWhAdmin={canRequestForBranch(currentUser, whMeta)} />}
         {effectiveTab === "suppliers" && canManageWarehouse(currentUser, whMeta) && <SupplierStatementTab lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
+        {effectiveTab === "branchStatement" && canManageWarehouse(currentUser, whMeta) && <BranchStatementTab meta={meta} lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
         {effectiveTab === "reports" && <ReportsTab lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
         {effectiveTab === "notifs" && canManageWarehouse(currentUser, whMeta) && <WarehouseNotificationsPanel lang={lang} t={t} />}
         {effectiveTab === "settings" && canManageWarehouse(currentUser, whMeta) && <WarehouseSettingsTab meta={meta} whMeta={whMeta} users={users} t={t} />}
