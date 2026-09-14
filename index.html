@@ -3233,7 +3233,7 @@ function App() {
         {effectiveTab === "dashboard" && canManageWarehouse(currentUser, whMeta) && <WarehouseDashboard lang={lang} t={t} setTab={setTab} meta={meta} currentUser={currentUser} whMeta={whMeta} />}
         {effectiveTab === "in" && canManageWarehouse(currentUser, whMeta) && <StockInTab currentUser={currentUser} lang={lang} t={t} />}
         {effectiveTab === "out" && <StockOutTab currentUser={currentUser} meta={meta} lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
-        {effectiveTab === "branchRequest" && <BranchRequestTab currentUser={currentUser} meta={meta} lang={lang} t={t} isWhAdmin={canManageWarehouse(currentUser, whMeta)} />}
+        {effectiveTab === "branchRequest" && <BranchRequestTab currentUser={currentUser} meta={meta} lang={lang} t={t} isWhAdmin={canRequestForBranch(currentUser, whMeta)} />}
         {effectiveTab === "quickscan" && <QuickScanTab currentUser={currentUser} meta={meta} lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
         {effectiveTab === "mainCount" && canManageWarehouse(currentUser, whMeta) && <MainWarehouseCountTab currentUser={currentUser} meta={meta} lang={lang} t={t} />}
         {effectiveTab === "count" && <BranchCountTab currentUser={currentUser} meta={meta} lang={lang} t={t} />}
@@ -3242,7 +3242,7 @@ function App() {
         {effectiveTab === "purchase" && canManageWarehouse(currentUser, whMeta) && <SuggestedPurchaseTab lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
         {effectiveTab === "expiry" && canManageWarehouse(currentUser, whMeta) && <ExpiryTab lang={lang} t={t} />}
         {effectiveTab === "equipment" && canManageWarehouse(currentUser, whMeta) && <EquipmentTab currentUser={currentUser} meta={meta} lang={lang} t={t} />}
-        {effectiveTab === "externalPurchase" && <ExternalPurchaseRequestTab currentUser={currentUser} meta={meta} lang={lang} t={t} isWhAdmin={canManageWarehouse(currentUser, whMeta)} />}
+        {effectiveTab === "externalPurchase" && <ExternalPurchaseRequestTab currentUser={currentUser} meta={meta} lang={lang} t={t} isWhAdmin={canRequestForBranch(currentUser, whMeta)} />}
         {effectiveTab === "suppliers" && canManageWarehouse(currentUser, whMeta) && <SupplierStatementTab lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
         {effectiveTab === "reports" && <ReportsTab lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
         {effectiveTab === "notifs" && canManageWarehouse(currentUser, whMeta) && <WarehouseNotificationsPanel lang={lang} t={t} />}
