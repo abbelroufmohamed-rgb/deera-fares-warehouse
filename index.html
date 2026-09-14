@@ -94,6 +94,8 @@ const PURCHASE_REQUESTS_COL = db.collection("whPurchaseRequests"); // طلبات
 const MAINTENANCE_COL = db.collection("whMaintenance"); // سجل صيانة كل معدة
 const EQUIPMENT_MOVES_COL = db.collection("whEquipmentMoves"); // حركات نقل المعدات (لفرع/للصيانة/عودة للمستودع)
 const MAINTENANCE_REQUESTS_COL = db.collection("whMaintenanceRequests"); // طلبات صيانة (بلاغ عطل) توصل للمسؤول
+const RECIPES_COL = db.collection("whRecipes"); // ريسبي: كل منتج مباع ومكوّناته من أصناف المستودع بمعيار الوحدة
+const SALES_BATCHES_COL = db.collection("whSalesBatches"); // دفعات مبيعات مرفوعة من فودكس (فرع + فترة)
 
 const ROLE_LABELS = {
   admin: "أدمن", financial_manager: "مدير مالي", accountant: "محاسب",
@@ -285,6 +287,28 @@ function LoginScreen({ users, onLogin }) {
 
 const DEFAULT_UNITS = ["كيلو", "جرام", "لتر", "مل", "قطعة", "كرتون", "علبة", "كيس", "دستة"];
 function branchStockDocId(branch, itemId) { return branch + "__" + itemId; }
+
+/* ============ استنزاف الدفعات بنظام FIFO (الأقرب صلاحية يتصرف الأول تلقائيًا) — بتتنادى بعد أي عملية صرف ============
+   ملاحظة: لو الكمية المصروفة أكبر من مجموع الدفعات المتتبّعة (يعني فيه وارد قديم بدون تاريخ صلاحية)، البقية بتتخصم
+   من "الرصيد الغير متتبّع بدفعة" ضمنيًا (مفيش حاجة تتعمل له، لأنه أصلاً مش مسجّل كدفعة). */
+async function depleteBatchesFIFO(itemId, qtyToDeplete) {
+  let remaining = Number(qtyToDeplete) || 0;
+  if (remaining <= 0.009) return;
+  try {
+    const snap = await BATCHES_COL.where("itemId", "==", itemId).get();
+    const batches = snap.docs
+      .map((d) => ({ id: d.id, ...d.data() }))
+      .filter((b) => (Number(b.remainingQty ?? b.qty) || 0) > 0.009)
+      .sort((a, b) => (a.expiryDate || "9999-12-31").localeCompare(b.expiryDate || "9999-12-31")); // الأقرب صلاحية أول عنصر
+    for (const b of batches) {
+      if (remaining <= 0.009) break;
+      const avail = Number(b.remainingQty ?? b.qty) || 0;
+      const take = Math.min(avail, remaining);
+      await BATCHES_COL.doc(b.id).update({ remainingQty: avail - take });
+      remaining -= take;
+    }
+  } catch (e) { /* الاستنزاف التلقائي أفضل-جهد ممكن — أي خطأ فيه ما يوقفش عملية الصرف الأساسية */ }
+}
 
 /* ============ شاشة إدارة الأصناف: إضافة/تعديل صنف بكوده وسعره وحده الأدنى — ثنائية اللغة ============ */
 function ItemsTab({ currentUser, lang, t, whMeta, meta }) {
@@ -1114,6 +1138,293 @@ function ExternalPurchaseRequestTab({ currentUser, meta, lang, t, isWhAdmin }) {
 }
 
 /* ============ طلب صيانة: أي حد يبلّغ عن عطل في معدة، والطلب يوصل للمسؤول (مدير المستودع) عشان يتابعه لحد ما يتقفل ============ */
+/* ============ إدارة الريسبي: كل منتج مباع (زي "كوب قهوة بارد") ومكوّناته من أصناف المستودع بالكمية المعيارية لكل وحدة ============ */
+function RecipesTab({ lang, t }) {
+  const [recipes, setRecipes] = useState(null);
+  const [items, setItems] = useState([]);
+  const [productName, setProductName] = useState("");
+  const [editingId, setEditingId] = useState(null);
+  const [ingredients, setIngredients] = useState([]); // [{ itemId, itemName, unit, qtyPerUnit }]
+  const [selectedItem, setSelectedItem] = useState(null);
+  const [qtyPerUnit, setQtyPerUnit] = useState("");
+  const [msg, setMsg] = useState("");
+  const [search, setSearch] = useState("");
+
+  useEffect(() => {
+    const unsub = RECIPES_COL.orderBy("productName").onSnapshot((snap) => setRecipes(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
+    return unsub;
+  }, []);
+  useEffect(() => {
+    const unsub = ITEMS_COL.orderBy("nameAr").onSnapshot((snap) => setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
+    return unsub;
+  }, []);
+
+  function addIngredient() {
+    const q = Number(qtyPerUnit);
+    if (!selectedItem) { setMsg(t("اختر الصنف أولًا", "Choose an item first")); return; }
+    if (!q || q <= 0) { setMsg(t("أدخل كمية صحيحة أكبر من صفر", "Enter a quantity greater than zero")); return; }
+    setIngredients((ing) => [...ing, { key: uid(), itemId: selectedItem.id, itemName: selectedItem.nameAr, itemNameEn: selectedItem.nameEn, unit: selectedItem.unit, qtyPerUnit: q }]);
+    setSelectedItem(null); setQtyPerUnit(""); setMsg("");
+  }
+  function removeIngredient(key) { setIngredients((ing) => ing.filter((i) => i.key !== key)); }
+
+  async function saveRecipe() {
+    if (!productName.trim()) { setMsg(t("اكتب اسم المنتج المباع بالظبط زي ما هو مكتوب في فودكس", "Enter the sold product name exactly as it appears in Foodics")); return; }
+    if (ingredients.length === 0) { setMsg(t("أضف مكوّن واحد على الأقل", "Add at least one ingredient")); return; }
+    try {
+      const payload = {
+        productName: productName.trim(),
+        ingredients: ingredients.map((i) => ({ itemId: i.itemId, itemName: i.itemName, itemNameEn: i.itemNameEn, unit: i.unit, qtyPerUnit: i.qtyPerUnit })),
+      };
+      if (editingId) {
+        await RECIPES_COL.doc(editingId).update(payload);
+        setMsg("✅ " + t("تم تحديث الريسبي", "Recipe updated"));
+      } else {
+        await RECIPES_COL.add({ ...payload, institutionId: DEFAULT_INSTITUTION_ID, createdAt: firebase.firestore.FieldValue.serverTimestamp() });
+        setMsg("✅ " + t("تم حفظ الريسبي", "Recipe saved"));
+      }
+      setProductName(""); setIngredients([]); setEditingId(null);
+    } catch (e) { setMsg("Error: " + e.message); }
+  }
+
+  function editRecipe(r) {
+    setProductName(r.productName);
+    setIngredients(r.ingredients.map((i) => ({ key: uid(), ...i })));
+    setEditingId(r.id);
+  }
+  async function removeRecipe(r) {
+    if (!confirm(t(`حذف ريسبي "${r.productName}"؟`, `Delete recipe "${r.productName}"?`))) return;
+    await RECIPES_COL.doc(r.id).delete();
+  }
+
+  const filtered = (recipes || []).filter((r) => r.productName.toLowerCase().includes(search.trim().toLowerCase()));
+
+  return (
+    <div>
+      <div style={cardStyle}>
+        <div style={cardTitle}>{editingId ? "✏️ " + t("تعديل ريسبي", "Edit recipe") : "➕ " + t("ريسبي جديد", "New recipe")}</div>
+        <div style={{ fontSize: 12.5, color: C.muted, marginBottom: 14 }}>{t("اكتب اسم المنتج بالظبط زي ما هو مكتوب في تقرير مبيعات فودكس، عشان المطابقة تنجح وقت المقارنة.", "Write the product name exactly as it appears in the Foodics sales report, so matching works when comparing.")}</div>
+        <div style={{ marginBottom: 14 }}>
+          <label style={smallLabel}>{t("اسم المنتج المباع (زي فودكس بالظبط)", "Sold product name (exactly as in Foodics)")}</label>
+          <input value={productName} onChange={(e) => setProductName(e.target.value)} style={{ ...inputStyle2, maxWidth: 400 }} placeholder={t("مثال: كوب قهوة بارد", "e.g. Cold Coffee Cup")} />
+        </div>
+        <div style={{ fontWeight: 700, fontSize: 13.5, color: C.navy, marginBottom: 10 }}>🧾 {t("مكوّنات المنتج (من أصناف المستودع)", "Product ingredients (from warehouse items)")}</div>
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-end" }}>
+          <div style={{ flex: "1 1 240px" }}>
+            <ItemPicker items={items} lang={lang} t={t} onPick={setSelectedItem} selectedItem={selectedItem} />
+          </div>
+          <div style={{ flex: "1 1 140px" }}>
+            <label style={smallLabel}>{t("الكمية لكل وحدة مباعة", "Qty per unit sold")} {selectedItem && `(${selectedItem.unit})`}</label>
+            <input type="number" step="0.001" value={qtyPerUnit} onChange={(e) => setQtyPerUnit(e.target.value)} style={inputStyle2} placeholder={t("مثال: 0.018 (18 جرام)", "e.g. 0.018 (18 grams)")} />
+          </div>
+          <button onClick={addIngredient} style={ghostBtn}>➕ {t("أضف مكوّن", "Add ingredient")}</button>
+        </div>
+
+        {ingredients.length > 0 && (
+          <div style={{ marginTop: 14 }}>
+            <table>
+              <thead><tr><th style={th}>{t("الصنف", "Item")}</th><th style={th}>{t("الكمية لكل وحدة", "Qty per unit")}</th><th style={th}></th></tr></thead>
+              <tbody>
+                {ingredients.map((i) => (
+                  <tr key={i.key}>
+                    <td style={{ ...td, fontWeight: 700 }}>{lang === "ar" ? i.itemName : (i.itemNameEn || i.itemName)}</td>
+                    <td style={td}>{fmt(i.qtyPerUnit)} {i.unit}</td>
+                    <td style={td}><span onClick={() => removeIngredient(i.key)} style={{ cursor: "pointer", color: C.danger, fontWeight: 700 }}>{t("حذف", "Remove")}</span></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+        <div style={{ marginTop: 14, display: "flex", gap: 10, alignItems: "center" }}>
+          <button onClick={saveRecipe} style={smallBtn}>{editingId ? t("💾 حفظ التعديل", "💾 Save changes") : t("➕ حفظ الريسبي", "➕ Save recipe")}</button>
+          {editingId && <button onClick={() => { setProductName(""); setIngredients([]); setEditingId(null); }} style={ghostBtn}>{t("إلغاء", "Cancel")}</button>}
+          {msg && <span style={{ fontSize: 13, color: msg.startsWith("✅") ? C.success : C.danger }}>{msg}</span>}
+        </div>
+      </div>
+
+      <div style={cardStyle}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14, flexWrap: "wrap", gap: 10 }}>
+          <div style={{ ...cardTitle, marginBottom: 0, border: "none", padding: 0 }}>📋 {t("كل الريسبيهات", "All recipes")} ({(recipes || []).length})</div>
+          <input value={search} onChange={(e) => setSearch(e.target.value)} style={{ ...inputStyle2, maxWidth: 220 }} placeholder={t("بحث...", "Search...")} />
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {filtered.map((r) => (
+            <div key={r.id} style={{ border: "1px solid " + C.border, borderRadius: 10, padding: 12 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div style={{ fontWeight: 800, color: C.navy }}>{r.productName}</div>
+                <div>
+                  <span onClick={() => editRecipe(r)} style={{ cursor: "pointer", color: C.blue, fontWeight: 700, fontSize: 13, marginLeft: 10 }}>{t("تعديل", "Edit")}</span>
+                  <span onClick={() => removeRecipe(r)} style={{ cursor: "pointer", color: C.danger, fontWeight: 700, fontSize: 13 }}>{t("حذف", "Delete")}</span>
+                </div>
+              </div>
+              <div style={{ fontSize: 12.5, color: C.muted, marginTop: 4 }}>
+                {r.ingredients.map((i) => `${lang === "ar" ? i.itemName : (i.itemNameEn || i.itemName)} (${fmt(i.qtyPerUnit)} ${i.unit})`).join(" + ")}
+              </div>
+            </div>
+          ))}
+          {filtered.length === 0 && <div style={{ color: "#9ca3af", fontSize: 13, textAlign: "center" }}>{t("لا يوجد ريسبيهات مسجّلة", "No recipes registered")}</div>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============ رفع مبيعات فودكس ومقارنة الاستهلاك النظري (حسب الريسبي) بالفعلي (المصروف من المستودع) ============ */
+function ConsumptionVarianceTab({ meta, lang, t, institutionName }) {
+  const [recipes, setRecipes] = useState([]);
+  const [moves, setMoves] = useState([]);
+  const [uploading, setUploading] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [branch, setBranch] = useState("");
+  const [fromDate, setFromDate] = useState(new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().slice(0, 10));
+  const [toDate, setToDate] = useState(todayStr());
+  const [salesRows, setSalesRows] = useState(null); // [{ productName, qty }] من آخر ملف مرفوع
+  const [unmatchedProducts, setUnmatchedProducts] = useState([]);
+  const fileInputRef = useRef(null);
+
+  useEffect(() => {
+    const unsub = RECIPES_COL.onSnapshot((snap) => setRecipes(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
+    return unsub;
+  }, []);
+  useEffect(() => {
+    const unsub = MOVES_COL.where("type", "==", "out").orderBy("createdAt", "desc").limit(3000).onSnapshot(
+      (snap) => setMoves(snap.docs.map((d) => ({ id: d.id, ...d.data() }))),
+      () => { MOVES_COL.orderBy("createdAt", "desc").limit(4000).onSnapshot((snap) => setMoves(snap.docs.map((d) => ({ id: d.id, ...d.data() })).filter((m) => m.type === "out"))); }
+    );
+    return unsub;
+  }, []);
+  useEffect(() => { if (!branch && meta.branches?.length) setBranch(meta.branches[0]); }, [meta.branches]);
+
+  async function uploadSalesFile(file) {
+    setUploading(true); setMsg("");
+    try {
+      const buf = await file.arrayBuffer();
+      const wb = window.XLSX.read(buf, { type: "array" });
+      const sheet = wb.Sheets[wb.SheetNames[0]];
+      const rows = window.XLSX.utils.sheet_to_json(sheet, { header: 1, blankrows: false });
+      const dataRows = rows.slice(1);
+      // نتوقّع عمودين على الأقل: اسم المنتج، والكمية المباعة (أي أعمدة زيادة بيتم تجاهلها)
+      const parsed = dataRows.map((r) => ({ productName: String(r[0] || "").trim(), qty: Number(r[1]) || 0 })).filter((r) => r.productName && r.qty > 0);
+      setSalesRows(parsed);
+      const recipeNames = new Set(recipes.map((r) => r.productName));
+      setUnmatchedProducts([...new Set(parsed.filter((r) => !recipeNames.has(r.productName)).map((r) => r.productName))]);
+      setMsg("✅ " + t(`تم رفع ${parsed.length} منتج من ملف المبيعات`, `${parsed.length} product(s) uploaded from the sales file`));
+    } catch (e) { setMsg("Error: " + e.message); }
+    setUploading(false);
+  }
+
+  // الاستهلاك النظري: لكل منتج مباع في الملف، نضرب الكمية المباعة × مكوّنات الريسبي بتاعه
+  const theoretical = useMemo(() => {
+    if (!salesRows) return {};
+    const map = {}; // { itemName: totalQty }
+    salesRows.forEach((sr) => {
+      const recipe = recipes.find((r) => r.productName === sr.productName);
+      if (!recipe) return;
+      recipe.ingredients.forEach((ing) => {
+        const key = ing.itemId;
+        if (!map[key]) map[key] = { itemName: ing.itemName, unit: ing.unit, qty: 0 };
+        map[key].qty += ing.qtyPerUnit * sr.qty;
+      });
+    });
+    return map;
+    // eslint-disable-next-line
+  }, [salesRows, recipes]);
+
+  // الاستهلاك الفعلي: من حركات الصرف الحقيقية لنفس الفرع ونفس الفترة
+  const actual = useMemo(() => {
+    const map = {};
+    moves.filter((m) => m.branch === branch && m.date >= fromDate && m.date <= toDate).forEach((m) => {
+      if (!map[m.itemId]) map[m.itemId] = { itemName: m.itemName, unit: m.unit, qty: 0 };
+      map[m.itemId].qty += Number(m.qty) || 0;
+    });
+    return map;
+    // eslint-disable-next-line
+  }, [moves, branch, fromDate, toDate]);
+
+  const comparisonRows = useMemo(() => {
+    const allItemIds = new Set([...Object.keys(theoretical), ...Object.keys(actual)]);
+    return Array.from(allItemIds).map((itemId) => {
+      const th = theoretical[itemId]?.qty || 0;
+      const ac = actual[itemId]?.qty || 0;
+      const name = theoretical[itemId]?.itemName || actual[itemId]?.itemName;
+      const unit = theoretical[itemId]?.unit || actual[itemId]?.unit;
+      const diff = ac - th; // موجب = مصروف فعليًا أكتر من المفروض (فاقد محتمل)
+      const diffPct = th > 0 ? (diff / th) * 100 : (ac > 0 ? 100 : 0);
+      return { itemId, name, unit, theoretical: th, actual: ac, diff, diffPct };
+    }).sort((a, b) => Math.abs(b.diff) - Math.abs(a.diff));
+    // eslint-disable-next-line
+  }, [theoretical, actual]);
+
+  function doPrint() { window.print(); }
+
+  return (
+    <div>
+      <div style={cardStyle} className="no-print">
+        <div style={cardTitle}>📊 {t("مقارنة الاستهلاك: النظري (ريسبي) مقابل الفعلي (مستودع)", "Consumption Comparison: Theoretical (Recipe) vs Actual (Warehouse)")}</div>
+        <div style={{ fontSize: 12.5, color: C.muted, marginBottom: 14 }}>{t("ارفع ملف مبيعات فودكس (عمود اسم المنتج، وعمود الكمية المباعة)، واختار الفرع والفترة اللي الملف بيغطيها بالظبط.", "Upload the Foodics sales file (product name column, quantity sold column), and choose the branch and period the file covers exactly.")}</div>
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-end" }}>
+          <div>
+            <label style={smallLabel}>{t("الفرع", "Branch")}</label>
+            <select value={branch} onChange={(e) => setBranch(e.target.value)} style={{ ...inputStyle2, maxWidth: 220 }}>
+              <GroupedBranchOptions meta={meta} />
+            </select>
+          </div>
+          <div><label style={smallLabel}>{t("من تاريخ", "From")}</label><input type="date" value={fromDate} onChange={(e) => setFromDate(e.target.value)} style={inputStyle2} /></div>
+          <div><label style={smallLabel}>{t("إلى تاريخ", "To")}</label><input type="date" value={toDate} onChange={(e) => setToDate(e.target.value)} style={inputStyle2} /></div>
+          <div>
+            <input type="file" accept=".xlsx,.xls" ref={fileInputRef} style={{ display: "none" }} onChange={(e) => { if (e.target.files[0]) uploadSalesFile(e.target.files[0]); e.target.value = ""; }} />
+            <button onClick={() => fileInputRef.current?.click()} disabled={uploading} style={smallBtn}>{uploading ? t("جارِ الرفع...", "Uploading...") : "⬆️ " + t("رفع ملف مبيعات فودكس", "Upload Foodics sales file")}</button>
+          </div>
+        </div>
+        {msg && <div style={{ marginTop: 10, fontSize: 13, color: msg.startsWith("✅") ? C.success : C.danger }}>{msg}</div>}
+        {unmatchedProducts.length > 0 && (
+          <div style={{ marginTop: 10, background: "#fff7ed", border: "1px solid #fed7aa", borderRadius: 8, padding: "8px 12px", fontSize: 12 }}>
+            ⚠️ {t(`${unmatchedProducts.length} منتج في ملف المبيعات مالوش ريسبي مسجّل (هيتجاهل من الحساب النظري): `, `${unmatchedProducts.length} product(s) in the sales file have no recipe registered (excluded from theoretical calc): `)}
+            {unmatchedProducts.slice(0, 8).join("، ")}{unmatchedProducts.length > 8 ? "..." : ""}
+          </div>
+        )}
+      </div>
+
+      {salesRows && (
+        <div className="print-area">
+          <div className="print-only-header"><h2>{institutionName}</h2><div>{t("تقرير مقارنة الاستهلاك", "Consumption Comparison Report")} — {branch} ({fromDate} → {toDate})</div></div>
+          <div style={cardStyle}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }} className="no-print">
+              <div style={cardTitle}>{t("جدول المقارنة", "Comparison table")}</div>
+              <button onClick={doPrint} style={ghostBtn}>🖨️ {t("طباعة", "Print")}</button>
+            </div>
+            <table>
+              <thead><tr>
+                <th style={th}>{t("الصنف", "Item")}</th>
+                <th style={th}>{t("النظري (حسب الريسبي)", "Theoretical (per recipe)")}</th>
+                <th style={th}>{t("الفعلي (مصروف من المستودع)", "Actual (issued from warehouse)")}</th>
+                <th style={th}>{t("الفرق", "Difference")}</th>
+                <th style={th}>{t("النسبة", "%")}</th>
+              </tr></thead>
+              <tbody>
+                {comparisonRows.map((r) => (
+                  <tr key={r.itemId} style={{ background: Math.abs(r.diffPct) >= 10 ? "#fef2f2" : undefined }}>
+                    <td style={{ ...td, fontWeight: 700 }}>{r.name}</td>
+                    <td style={td}>{fmt(r.theoretical)} {r.unit}</td>
+                    <td style={td}>{fmt(r.actual)} {r.unit}</td>
+                    <td style={{ ...td, fontWeight: 700, color: r.diff > 0 ? C.danger : r.diff < 0 ? C.success : C.muted }}>{r.diff > 0 ? "+" : ""}{fmt(r.diff)}</td>
+                    <td style={{ ...td, fontWeight: 700, color: Math.abs(r.diffPct) >= 10 ? C.danger : C.muted }}>{r.diffPct > 0 ? "+" : ""}{r.diffPct.toFixed(1)}%</td>
+                  </tr>
+                ))}
+                {comparisonRows.length === 0 && <tr><td colSpan={5} style={{ ...td, textAlign: "center", color: "#9ca3af" }}>{t("لا يوجد بيانات للمقارنة", "No data to compare")}</td></tr>}
+              </tbody>
+            </table>
+            <div style={{ marginTop: 12, fontSize: 11.5, color: C.muted }}>
+              {t("الفرق الموجب (أحمر) = اتصرف من المستودع فعليًا أكتر من المفروض حسب الريسبي (فاقد/هدر محتمل). الفرق السالب (أخضر) = اتصرف أقل من المفروض.", "Positive difference (red) = actually issued from warehouse more than the recipe implies (possible waste/loss). Negative (green) = issued less than expected.")}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function MaintenanceRequestTab({ currentUser, lang, t, isResponsible }) {
   const [equipment, setEquipment] = useState([]);
   const [requests, setRequests] = useState([]);
@@ -1125,6 +1436,11 @@ function MaintenanceRequestTab({ currentUser, lang, t, isResponsible }) {
   const [filterStatus, setFilterStatus] = useState("pending");
   const [assignInputs, setAssignInputs] = useState({}); // { requestId: assignedToText }
   const [busyId, setBusyId] = useState(null);
+  const [quoteFormId, setQuoteFormId] = useState(null); // بلاغ عرض فورم عرض السعر بتاعه
+  const [quoteForm, setQuoteForm] = useState({ vendor: "", cost: "", note: "" });
+
+  const isFinancialApprover = currentUser.role === "financial_manager" || currentUser.role === "admin"; // من أدوار الكاشير المشتركة
+  const canApproveExpense = isResponsible || isFinancialApprover;
 
   useEffect(() => {
     const unsub = EQUIPMENT_COL.orderBy("name").onSnapshot((snap) => setEquipment(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
@@ -1136,8 +1452,11 @@ function MaintenanceRequestTab({ currentUser, lang, t, isResponsible }) {
   }, []);
 
   const URGENCY_LABEL = { normal: t("عادي", "Normal"), urgent: t("عاجل", "Urgent") };
-  const STATUS_LABEL = { pending: t("قيد الانتظار", "Pending"), in_progress: t("جارِ التنفيذ", "In progress"), done: t("تم الإصلاح", "Resolved"), rejected: t("مرفوض", "Rejected") };
-  const STATUS_COLOR = { pending: C.warn, in_progress: C.blue, done: C.success, rejected: C.danger };
+  const STATUS_LABEL = {
+    pending: t("قيد الانتظار", "Pending"), in_progress: t("جارِ التنفيذ", "In progress"), done: t("تم الإصلاح", "Resolved"), rejected: t("مرفوض", "Rejected"),
+    awaiting_expense_approval: t("بانتظار اعتماد الصرف", "Awaiting expense approval"),
+  };
+  const STATUS_COLOR = { pending: C.warn, in_progress: C.blue, done: C.success, rejected: C.danger, awaiting_expense_approval: "#7c3aed" };
 
   async function submitRequest() {
     const eq = equipment.find((e) => e.id === equipmentId);
@@ -1156,6 +1475,37 @@ function MaintenanceRequestTab({ currentUser, lang, t, isResponsible }) {
     setSaving(false);
   }
 
+  async function submitQuote(r) {
+    if (!quoteForm.vendor.trim()) { setMsg(t("اكتب اسم مقدّم الخدمة الخارجي", "Enter the external vendor's name")); return; }
+    if (!Number(quoteForm.cost) || Number(quoteForm.cost) <= 0) { setMsg(t("أدخل تكلفة عرض السعر", "Enter the quote cost")); return; }
+    try {
+      await MAINTENANCE_REQUESTS_COL.doc(r.id).update({
+        status: "awaiting_expense_approval", isExternal: true,
+        quoteVendor: quoteForm.vendor.trim(), quoteCost: Number(quoteForm.cost), quoteNote: quoteForm.note.trim(),
+        quoteSubmittedBy: currentUser.name, quoteSubmittedAt: firebase.firestore.FieldValue.serverTimestamp(),
+      });
+      setQuoteFormId(null); setQuoteForm({ vendor: "", cost: "", note: "" });
+      setMsg("✅ " + t("تم إرسال عرض السعر لاعتماد مدير المستودع/المدير المالي", "Quote sent for warehouse/financial manager approval"));
+    } catch (e) { setMsg("Error: " + e.message); }
+  }
+
+  async function approveExpense(r, approve) {
+    setBusyId(r.id);
+    try {
+      if (approve) {
+        await MAINTENANCE_REQUESTS_COL.doc(r.id).update({
+          status: "in_progress", assignedTo: r.quoteVendor,
+          expenseApprovedBy: currentUser.name, expenseApprovedAt: firebase.firestore.FieldValue.serverTimestamp(),
+        });
+      } else {
+        await MAINTENANCE_REQUESTS_COL.doc(r.id).update({
+          status: "rejected", expenseApprovedBy: currentUser.name, expenseApprovedAt: firebase.firestore.FieldValue.serverTimestamp(), resolvedAt: firebase.firestore.FieldValue.serverTimestamp(),
+        });
+      }
+    } catch (e) { setMsg("Error: " + e.message); }
+    setBusyId(null);
+  }
+
   async function updateStatus(r, status) {
     setBusyId(r.id);
     try {
@@ -1166,7 +1516,7 @@ function MaintenanceRequestTab({ currentUser, lang, t, isResponsible }) {
       // لو اتقفل كـ"تم الإصلاح"، نسجّله تلقائيًا في سجل صيانة المعدة الرسمي
       if (status === "done") {
         await MAINTENANCE_COL.add({
-          equipmentId: r.equipmentId, date: todayStr(), description: r.issue, cost: 0,
+          equipmentId: r.equipmentId, date: todayStr(), description: r.issue, cost: r.quoteCost || 0,
           performedBy: r.assignedTo || currentUser.name, institutionId: DEFAULT_INSTITUTION_ID, createdAt: firebase.firestore.FieldValue.serverTimestamp(),
         });
       }
@@ -1210,7 +1560,7 @@ function MaintenanceRequestTab({ currentUser, lang, t, isResponsible }) {
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 14 }}>
           <div style={{ ...cardTitle, marginBottom: 0, border: "none", padding: 0 }}>🕒 {t("بلاغات الصيانة", "Maintenance Reports")} {pendingCount > 0 && <span style={{ background: C.danger, color: "#fff", borderRadius: 20, padding: "2px 10px", fontSize: 12, marginRight: 8 }}>{pendingCount} {t("قيد الانتظار", "pending")}</span>}</div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-            {["pending", "in_progress", "done", "rejected", "all"].map((s) => (
+            {["pending", "awaiting_expense_approval", "in_progress", "done", "rejected", "all"].map((s) => (
               <button key={s} onClick={() => setFilterStatus(s)} style={filterStatus === s ? smallBtn : ghostBtn}>{s === "all" ? t("الكل", "All") : STATUS_LABEL[s]}</button>
             ))}
           </div>
@@ -1231,12 +1581,36 @@ function MaintenanceRequestTab({ currentUser, lang, t, isResponsible }) {
               </div>
               <div style={{ fontSize: 13.5, color: C.text, marginBottom: 8 }}>{r.issue}</div>
               {r.assignedTo && <div style={{ fontSize: 12, color: C.muted, marginBottom: 8 }}>{t("مسؤول عنها:", "Assigned to:")} {r.assignedTo}</div>}
+              {r.quoteVendor && (
+                <div style={{ fontSize: 12.5, background: "#faf5ff", border: "1px solid #ddd6fe", borderRadius: 8, padding: "8px 12px", marginBottom: 8 }}>
+                  🧾 {t("عرض سعر خارجي:", "External quote:")} <b>{r.quoteVendor}</b> — {fmt(r.quoteCost)} {t("ر.س", "SAR")} {r.quoteNote && "— " + r.quoteNote}
+                </div>
+              )}
               {isResponsible && r.status === "pending" && (
                 <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
                   <input value={assignInputs[r.id] || ""} onChange={(e) => setAssignInputs((a) => ({ ...a, [r.id]: e.target.value }))} placeholder={t("اسم اللي هيتابعها (اختياري)", "Who's handling it (optional)")} style={{ ...inputStyle2, maxWidth: 220 }} />
-                  <button onClick={() => updateStatus(r, "in_progress")} disabled={busyId === r.id} style={smallBtn}>▶️ {t("بدء المعالجة", "Start handling")}</button>
+                  <button onClick={() => updateStatus(r, "in_progress")} disabled={busyId === r.id} style={smallBtn}>▶️ {t("بدء المعالجة الداخلية", "Start internal handling")}</button>
+                  <button onClick={() => setQuoteFormId(quoteFormId === r.id ? null : r.id)} disabled={busyId === r.id} style={{ ...ghostBtn, color: "#7c3aed", borderColor: "#7c3aed" }}>🧾 {t("صيانة خارجية (عرض سعر)", "External maintenance (quote)")}</button>
                   <button onClick={() => updateStatus(r, "rejected")} disabled={busyId === r.id} style={{ ...ghostBtn, color: C.danger, borderColor: C.danger }}>{t("رفض", "Reject")}</button>
                 </div>
+              )}
+              {isResponsible && quoteFormId === r.id && (
+                <div style={{ marginTop: 10, background: "#faf5ff", borderRadius: 8, padding: 12, display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-end" }}>
+                  <div><label style={smallLabel}>{t("مقدّم الخدمة الخارجي", "External vendor")}</label><input value={quoteForm.vendor} onChange={(e) => setQuoteForm((f) => ({ ...f, vendor: e.target.value }))} style={{ ...inputStyle2, width: 180 }} /></div>
+                  <div><label style={smallLabel}>{t("تكلفة عرض السعر", "Quote cost")}</label><input type="number" step="0.01" value={quoteForm.cost} onChange={(e) => setQuoteForm((f) => ({ ...f, cost: e.target.value }))} style={{ ...inputStyle2, width: 130 }} /></div>
+                  <div style={{ flex: "1 1 180px" }}><label style={smallLabel}>{t("ملاحظة (اختياري)", "Note (optional)")}</label><input value={quoteForm.note} onChange={(e) => setQuoteForm((f) => ({ ...f, note: e.target.value }))} style={inputStyle2} /></div>
+                  <button onClick={() => submitQuote(r)} style={smallBtn}>📤 {t("إرسال للاعتماد", "Send for approval")}</button>
+                </div>
+              )}
+              {r.status === "awaiting_expense_approval" && (
+                canApproveExpense ? (
+                  <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+                    <button onClick={() => approveExpense(r, true)} disabled={busyId === r.id} style={smallBtn}>✅ {t("اعتماد الصرف", "Approve expense")}</button>
+                    <button onClick={() => approveExpense(r, false)} disabled={busyId === r.id} style={{ ...ghostBtn, color: C.danger, borderColor: C.danger }}>{t("إلغاء", "Cancel")}</button>
+                  </div>
+                ) : (
+                  <div style={{ fontSize: 11.5, color: C.muted, marginTop: 6 }}>{t("بانتظار اعتماد مدير المستودع أو المدير المالي", "Awaiting warehouse or financial manager approval")}</div>
+                )
               )}
               {isResponsible && r.status === "in_progress" && (
                 <button onClick={() => updateStatus(r, "done")} disabled={busyId === r.id} style={smallBtn}>✅ {t("تم الإصلاح", "Mark as resolved")}</button>
@@ -2242,6 +2616,7 @@ function StockOutTab({ currentUser, meta, lang, t, institutionName }) {
           createdAt: firebase.firestore.FieldValue.serverTimestamp(),
         });
       });
+      await depleteBatchesFIFO(selectedItem.id, q); // استنزاف الدفعات بنظام الأقرب صلاحية أولًا
       setMsg("✅ " + t(`تم صرف ${fmt(q)} ${selectedItem.unit} لفرع ${branch}`, `Issued ${fmt(q)} ${selectedItem.unit} to ${branch}`));
       setFreshVoucher({ id: moveId, itemName: selectedItem.nameAr, itemNameEn: selectedItem.nameEn, unit: selectedItem.unit, qty: q, price: selectedItem.price, branch, date: todayStr(), note, enteredBy: currentUser.name });
       setSelectedItem(null); setQty(""); setNote("");
@@ -2367,6 +2742,7 @@ function QuickScanTab({ currentUser, meta, lang, t, institutionName }) {
           createdAt: firebase.firestore.FieldValue.serverTimestamp(),
         });
       });
+      await depleteBatchesFIFO(pendingItem.id, q); // استنزاف الدفعات بنظام الأقرب صلاحية أولًا
       setSessionLog((log) => [{ name: lang === "ar" ? pendingItem.nameAr : (pendingItem.nameEn || pendingItem.nameAr), qty: q, unit: pendingItem.unit }, ...log]);
       setPendingItem(null); setQty("1");
       setShowScanner(true); // يفتح الكاميرا تلقائيًا للصنف التالي
@@ -2536,6 +2912,7 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin, canConfirmRec
             createdAt: firebase.firestore.FieldValue.serverTimestamp(),
           });
         });
+        await depleteBatchesFIFO(l.itemId, l.qtyReceived); // استنزاف الدفعات بنظام الأقرب صلاحية أولًا
       }
       const allFulfilled = finalLines.every((l) => l.qtyReceived >= l.qtyRequested);
       await REQUESTS_COL.doc(req.id).update({
@@ -2875,6 +3252,9 @@ function MainWarehouseCountTab({ currentUser, meta, lang, t }) {
 function BranchCountTab({ currentUser, meta, lang, t }) {
   const [branch, setBranch] = useState("");
   const [branchStock, setBranchStock] = useState([]);
+  const [extraItems, setExtraItems] = useState([]); // أصناف أضيفت يدويًا للجرد (مالهاش سجل مخزون سابق في الفرع)
+  const [allItems, setAllItems] = useState([]);
+  const [addItemPick, setAddItemPick] = useState(null);
   const [counted, setCounted] = useState({}); // { itemId: countedQty }
   const [saving, setSaving] = useState(false);
   const [msg, setMsg] = useState("");
@@ -2882,7 +3262,12 @@ function BranchCountTab({ currentUser, meta, lang, t }) {
 
   useEffect(() => { if (!branch && meta.branches?.length) setBranch(meta.branches[0]); }, [meta.branches]);
   useEffect(() => {
+    const unsub = ITEMS_COL.orderBy("nameAr").onSnapshot((snap) => setAllItems(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
+    return unsub;
+  }, []);
+  useEffect(() => {
     if (!branch) return;
+    setExtraItems([]); // نصفّر الأصناف اليدوية لما نغيّر الفرع
     const unsub = BRANCH_STOCK_COL.where("branch", "==", branch).onSnapshot(
       (snap) => setBranchStock(snap.docs.map((d) => ({ id: d.id, ...d.data() }))),
       () => { BRANCH_STOCK_COL.onSnapshot((snap) => setBranchStock(snap.docs.map((d) => ({ id: d.id, ...d.data() })).filter((b) => b.branch === branch))); }
@@ -2900,8 +3285,18 @@ function BranchCountTab({ currentUser, meta, lang, t }) {
 
   function setCountedQty(itemId, val) { setCounted((c) => ({ ...c, [itemId]: val })); }
 
+  function addItemToCount() {
+    if (!addItemPick) return;
+    const already = branchStock.some((b) => b.itemId === addItemPick.id) || extraItems.some((b) => b.itemId === addItemPick.id);
+    if (already) { setMsg(t("الصنف ده موجود بالفعل في قائمة الجرد", "This item is already in the count list")); return; }
+    setExtraItems((ex) => [...ex, { id: "extra_" + addItemPick.id, itemId: addItemPick.id, itemName: addItemPick.nameAr, itemNameEn: addItemPick.nameEn, unit: addItemPick.unit, qty: 0 }]);
+    setAddItemPick(null); setMsg("");
+  }
+
+  const fullList = [...branchStock, ...extraItems];
+
   async function submitCounts() {
-    const toSubmit = branchStock.filter((b) => counted[b.itemId] !== undefined && counted[b.itemId] !== "");
+    const toSubmit = fullList.filter((b) => counted[b.itemId] !== undefined && counted[b.itemId] !== "");
     if (toSubmit.length === 0) { setMsg(t("أدخل كمية فعلية لصنف واحد على الأقل", "Enter a counted quantity for at least one item")); return; }
     setSaving(true); setMsg("");
     try {
@@ -2914,7 +3309,7 @@ function BranchCountTab({ currentUser, meta, lang, t }) {
           branch, itemId: b.itemId, itemName: b.itemName, systemQty, countedQty, diff, date: todayStr(),
           countedBy: currentUser.name, institutionId: DEFAULT_INSTITUTION_ID, createdAt: firebase.firestore.FieldValue.serverTimestamp(),
         });
-        await BRANCH_STOCK_COL.doc(b.id).update({ qty: countedQty }); // الجرد بيصحّح الرصيد ليبقى نقطة البداية الجديدة
+        await BRANCH_STOCK_COL.doc(branchStockDocId(branch, b.itemId)).set({ branch, itemId: b.itemId, itemName: b.itemName, qty: countedQty, institutionId: DEFAULT_INSTITUTION_ID }, { merge: true }); // الجرد بيصحّح الرصيد ليبقى نقطة البداية الجديدة (وبيُنشئ سجل جديد لو الصنف مضاف يدويًا)
         if (countedQty <= 0 || diff < -0.009) {
           shortages.push({ itemName: b.itemName, countedQty, diff });
         }
@@ -2942,27 +3337,36 @@ function BranchCountTab({ currentUser, meta, lang, t }) {
             <GroupedBranchOptions meta={meta} />
           </select>
         </div>
+        <div style={{ background: C.blueSoft, borderRadius: 10, padding: 12, marginBottom: 14 }}>
+          <div style={{ fontWeight: 700, fontSize: 12.5, color: C.navy, marginBottom: 8 }}>➕ {t("إضافة صنف للجرد (لو مش ظاهر في القائمة تحت)", "Add item to count (if not already listed below)")}</div>
+          <div style={{ display: "flex", gap: 10, alignItems: "flex-end", flexWrap: "wrap" }}>
+            <div style={{ flex: "1 1 240px" }}>
+              <ItemPicker items={allItems} lang={lang} t={t} onPick={setAddItemPick} selectedItem={addItemPick} />
+            </div>
+            <button onClick={addItemToCount} style={ghostBtn}>➕ {t("أضف للجرد", "Add to count")}</button>
+          </div>
+        </div>
         <div style={{ overflowX: "auto" }}>
           <table>
             <thead><tr><th style={th}>{t("الصنف", "Item")}</th><th style={th}>{t("المتوقع (حسب النظام)", "Expected (system)")}</th><th style={th}>{t("الكمية الفعلية المجرودة", "Actual counted qty")}</th><th style={th}>{t("الفرق", "Diff")}</th></tr></thead>
             <tbody>
-              {branchStock.map((b) => {
+              {fullList.map((b) => {
                 const c = counted[b.itemId];
                 const diff = c !== undefined && c !== "" ? Number(c) - Number(b.qty) : null;
                 return (
                   <tr key={b.id}>
-                    <td style={{ ...td, fontWeight: 700 }}>{b.itemName}</td>
+                    <td style={{ ...td, fontWeight: 700 }}>{b.itemName}{b.id.startsWith("extra_") && <span style={{ fontSize: 10.5, color: C.blue, marginRight: 6 }}>({t("مضاف يدويًا", "manually added")})</span>}</td>
                     <td style={td}>{fmt(b.qty)}</td>
                     <td style={td}><input type="number" step="0.01" value={c || ""} onChange={(e) => setCountedQty(b.itemId, e.target.value)} style={{ ...inputStyle2, width: 110 }} /></td>
                     <td style={{ ...td, fontWeight: 700, color: diff === null ? C.muted : diff < 0 ? C.danger : diff > 0 ? C.success : C.muted }}>{diff === null ? "—" : (diff > 0 ? "+" : "") + fmt(diff)}</td>
                   </tr>
                 );
               })}
-              {branchStock.length === 0 && <tr><td colSpan={4} style={{ ...td, textAlign: "center", color: "#9ca3af" }}>{t("مفيش أصناف اتصرفت لهذا الفرع بعد", "No items have been issued to this branch yet")}</td></tr>}
+              {fullList.length === 0 && <tr><td colSpan={4} style={{ ...td, textAlign: "center", color: "#9ca3af" }}>{t("مفيش أصناف — أضف صنف يدويًا فوق للبدء", "No items — add one manually above to get started")}</td></tr>}
             </tbody>
           </table>
         </div>
-        {branchStock.length > 0 && (
+        {fullList.length > 0 && (
           <div style={{ marginTop: 14 }}>
             <button onClick={submitCounts} disabled={saving} style={smallBtn}>{saving ? t("جارِ الحفظ...", "Saving...") : "💾 " + t("حفظ الجرد", "Save count")}</button>
           </div>
@@ -2994,6 +3398,104 @@ function BranchCountTab({ currentUser, meta, lang, t }) {
 
 /* ============ شاشة الإشعارات (نقص الأصناف عند الفروع) ============ */
 /* ============ شاشة تتبّع تواريخ الصلاحية: كل الدفعات مرتّبة، مع تلوين القريب من الانتهاء أو المنتهي ============ */
+/* ============ كشوفات الجرد: تجميع سجلات الجرد المتفرّقة (صنف صنف) في "جلسات جرد" واضحة — التاريخ، المكان، ومين اللي جرد ============ */
+function CountSessionsTab({ lang, t, institutionName }) {
+  const [allCounts, setAllCounts] = useState(null);
+  const [openSession, setOpenSession] = useState(null);
+  const [locationFilter, setLocationFilter] = useState("all");
+
+  const MAIN_WH_LABEL = t("المستودع الرئيسي", "Main Warehouse");
+
+  useEffect(() => {
+    const unsub = COUNTS_COL.orderBy("createdAt", "desc").limit(1000).onSnapshot((snap) => setAllCounts(snap.docs.map((d) => ({ id: d.id, ...d.data() }))), () => setAllCounts([]));
+    return unsub;
+  }, []);
+
+  // تجميع سجلات الجرد (صنف صنف) في "جلسات": نفس التاريخ + نفس المكان + نفس مين جرد = جلسة واحدة
+  const sessions = useMemo(() => {
+    if (!allCounts) return [];
+    const map = {};
+    allCounts.forEach((c) => {
+      const key = `${c.date}__${c.branch}__${c.countedBy}`;
+      if (!map[key]) map[key] = { key, date: c.date, location: c.branch, countedBy: c.countedBy, items: [], shortageCount: 0, surplusCount: 0 };
+      map[key].items.push(c);
+      if (c.diff < -0.009) map[key].shortageCount++;
+      if (c.diff > 0.009) map[key].surplusCount++;
+    });
+    return Object.values(map).sort((a, b) => b.date.localeCompare(a.date));
+    // eslint-disable-next-line
+  }, [allCounts]);
+
+  const locations = [MAIN_WH_LABEL, ...new Set(sessions.filter((s) => s.location !== MAIN_WH_LABEL).map((s) => s.location))];
+  const filteredSessions = locationFilter === "all" ? sessions : sessions.filter((s) => s.location === locationFilter);
+
+  function doPrint() { window.print(); }
+
+  if (allCounts === null) return <div style={{ color: C.muted, padding: 20 }}>...</div>;
+
+  return (
+    <div>
+      <div style={cardStyle} className="no-print">
+        <div style={cardTitle}>📑 {t("كشوفات الجرد", "Count Statements")}</div>
+        <div style={{ fontSize: 12.5, color: C.muted, marginBottom: 14 }}>{t("كل جلسة جرد (تاريخ معيّن + مكان معيّن + موظف معيّن) مجمّعة هنا بضغطة واحدة تفتح كل تفاصيلها.", "Every count session (a specific date + location + employee) is grouped here — one click opens all its details.")}</div>
+        <div>
+          <label style={smallLabel}>{t("فلترة حسب المكان", "Filter by location")}</label>
+          <select value={locationFilter} onChange={(e) => setLocationFilter(e.target.value)} style={{ ...inputStyle2, maxWidth: 240 }}>
+            <option value="all">{t("كل الأماكن", "All locations")}</option>
+            {locations.map((l) => <option key={l} value={l}>{l}</option>)}
+          </select>
+        </div>
+      </div>
+
+      <div className="print-area">
+        <div className="print-only-header"><h2>{institutionName}</h2><div>{t("كشوفات الجرد", "Count Statements")}</div></div>
+        <div style={cardStyle}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }} className="no-print">
+            <div style={cardTitle}>{t("جلسات الجرد", "Count sessions")} ({filteredSessions.length})</div>
+            <button onClick={doPrint} style={ghostBtn}>🖨️ {t("طباعة", "Print")}</button>
+          </div>
+          <table>
+            <thead><tr><th style={th}>{t("التاريخ", "Date")}</th><th style={th}>📍 {t("المكان", "Location")}</th><th style={th}>👤 {t("الموظف اللي جرد", "Counted by")}</th><th style={th}>{t("عدد الأصناف", "Items counted")}</th><th style={th}>{t("نواقص", "Shortages")}</th><th style={th}>{t("زيادات", "Surpluses")}</th><th style={th}></th></tr></thead>
+            <tbody>
+              {filteredSessions.map((s) => (
+                <React.Fragment key={s.key}>
+                  <tr>
+                    <td style={{ ...td, fontWeight: 700 }}>{s.date}</td>
+                    <td style={td}>{s.location}</td>
+                    <td style={{ ...td, fontWeight: 700 }}>{s.countedBy}</td>
+                    <td style={td}>{s.items.length}</td>
+                    <td style={{ ...td, color: s.shortageCount > 0 ? C.danger : C.muted, fontWeight: s.shortageCount > 0 ? 700 : 400 }}>{s.shortageCount}</td>
+                    <td style={{ ...td, color: s.surplusCount > 0 ? C.success : C.muted, fontWeight: s.surplusCount > 0 ? 700 : 400 }}>{s.surplusCount}</td>
+                    <td style={td} className="no-print"><span onClick={() => setOpenSession(openSession === s.key ? null : s.key)} style={{ cursor: "pointer", color: C.blue, fontWeight: 700 }}>{openSession === s.key ? t("إخفاء", "Hide") : t("عرض التفاصيل", "View details")}</span></td>
+                  </tr>
+                  {openSession === s.key && (
+                    <tr>
+                      <td colSpan={7} style={{ background: C.blueSoft, padding: 12 }}>
+                        <table>
+                          <thead><tr><th style={th}>{t("الصنف", "Item")}</th><th style={th}>{t("المتوقع", "Expected")}</th><th style={th}>{t("الفعلي المجرود", "Counted")}</th><th style={th}>{t("الفرق", "Diff")}</th></tr></thead>
+                          <tbody>
+                            {s.items.map((it) => (
+                              <tr key={it.id}>
+                                <td style={td}>{it.itemName}</td><td style={td}>{fmt(it.systemQty)}</td><td style={td}>{fmt(it.countedQty)}</td>
+                                <td style={{ ...td, fontWeight: 700, color: it.diff < 0 ? C.danger : it.diff > 0 ? C.success : C.muted }}>{it.diff > 0 ? "+" : ""}{fmt(it.diff)}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </td>
+                    </tr>
+                  )}
+                </React.Fragment>
+              ))}
+              {filteredSessions.length === 0 && <tr><td colSpan={7} style={{ ...td, textAlign: "center", color: "#9ca3af" }}>{t("لا يوجد جلسات جرد مسجّلة", "No count sessions recorded")}</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ExpiryTab({ lang, t }) {
   const [batches, setBatches] = useState(null);
   const [markingId, setMarkingId] = useState(null);
@@ -3399,6 +3901,7 @@ const TAB_DEFS_WH = [
   { id: "branchRequest", labelAr: "طلب من المستودع", labelEn: "Request from Warehouse" },
   { id: "quickscan", labelAr: "⚡ مسح سريع", labelEn: "⚡ Quick Scan" },
   { id: "mainCount", labelAr: "🏢🧮 جرد المستودع الرئيسي", labelEn: "🏢🧮 Main Warehouse Count" },
+  { id: "countSessions", labelAr: "📑 كشوفات الجرد", labelEn: "📑 Count Statements" },
   { id: "count", labelAr: "جرد الفروع", labelEn: "Branch Count" },
   { id: "items", labelAr: "الأصناف", labelEn: "Items" },
   { id: "labels", labelAr: "طباعة ملصقات", labelEn: "Print Labels" },
@@ -3406,6 +3909,8 @@ const TAB_DEFS_WH = [
   { id: "expiry", labelAr: "الصلاحية", labelEn: "Expiry" },
   { id: "equipment", labelAr: "🔧 المعدات والصيانة", labelEn: "🔧 Equipment & Maintenance" },
   { id: "maintenanceRequest", labelAr: "🔧📋 طلب صيانة", labelEn: "🔧📋 Maintenance Request" },
+  { id: "recipes", labelAr: "🧾 الريسبي", labelEn: "🧾 Recipes" },
+  { id: "variance", labelAr: "📊 مقارنة الاستهلاك", labelEn: "📊 Consumption Variance" },
   { id: "externalPurchase", labelAr: "🛒 طلب شراء خارجي", labelEn: "🛒 External Purchase" },
   { id: "suppliers", labelAr: "كشف حساب مورد", labelEn: "Supplier Statement" },
   { id: "branchStatement", labelAr: "📋 كشف حساب فرع", labelEn: "📋 Branch Statement" },
@@ -3685,7 +4190,7 @@ function App() {
   const visibleTabs = maintenanceOnly
     ? TAB_DEFS_WH.filter((tb) => tb.id === "maintenanceRequest") // مسؤول الصيانة يشوف تبويب واحد بس، مفيش أي حاجة تانية
     : TAB_DEFS_WH.filter((tb) => {
-        if (["items", "in", "settings", "notifs", "labels", "purchase", "expiry", "suppliers", "dashboard", "equipment", "mainCount", "branchStatement"].includes(tb.id)) return canManageWarehouse(currentUser, whMeta);
+        if (["items", "in", "settings", "notifs", "labels", "purchase", "expiry", "suppliers", "dashboard", "equipment", "mainCount", "branchStatement", "recipes", "variance", "countSessions"].includes(tb.id)) return canManageWarehouse(currentUser, whMeta);
         return true; // out, count, reports, quickscan, branchRequest متاحة لمدير المستودع وموظفه
       });
   const effectiveTab = visibleTabs.some((tb) => tb.id === tab) ? tab : (visibleTabs[0]?.id || (maintenanceOnly ? "maintenanceRequest" : "out"));
@@ -3732,6 +4237,7 @@ function App() {
         )}
         {effectiveTab === "quickscan" && <QuickScanTab currentUser={currentUser} meta={meta} lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
         {effectiveTab === "mainCount" && canManageWarehouse(currentUser, whMeta) && <MainWarehouseCountTab currentUser={currentUser} meta={meta} lang={lang} t={t} />}
+        {effectiveTab === "countSessions" && canManageWarehouse(currentUser, whMeta) && <CountSessionsTab lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
         {effectiveTab === "count" && <BranchCountTab currentUser={currentUser} meta={meta} lang={lang} t={t} />}
         {effectiveTab === "items" && canManageWarehouse(currentUser, whMeta) && <ItemsTab currentUser={currentUser} lang={lang} t={t} whMeta={whMeta} meta={meta} />}
         {effectiveTab === "labels" && canManageWarehouse(currentUser, whMeta) && <BulkLabelsTab lang={lang} t={t} />}
@@ -3739,6 +4245,8 @@ function App() {
         {effectiveTab === "expiry" && canManageWarehouse(currentUser, whMeta) && <ExpiryTab lang={lang} t={t} />}
         {effectiveTab === "equipment" && canManageWarehouse(currentUser, whMeta) && <EquipmentTab currentUser={currentUser} meta={meta} lang={lang} t={t} />}
         {effectiveTab === "maintenanceRequest" && <MaintenanceRequestTab currentUser={currentUser} lang={lang} t={t} isResponsible={isMaintenanceResponsible(currentUser, whMeta)} />}
+        {effectiveTab === "recipes" && canManageWarehouse(currentUser, whMeta) && <RecipesTab lang={lang} t={t} />}
+        {effectiveTab === "variance" && canManageWarehouse(currentUser, whMeta) && <ConsumptionVarianceTab meta={meta} lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
         {effectiveTab === "externalPurchase" && <ExternalPurchaseRequestTab currentUser={currentUser} meta={meta} lang={lang} t={t} isWhAdmin={canRequestForBranch(currentUser, whMeta)} />}
         {effectiveTab === "suppliers" && canManageWarehouse(currentUser, whMeta) && <SupplierStatementTab lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
         {effectiveTab === "branchStatement" && canManageWarehouse(currentUser, whMeta) && <BranchStatementTab meta={meta} lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
