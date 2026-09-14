@@ -2429,7 +2429,7 @@ function QuickScanTab({ currentUser, meta, lang, t, institutionName }) {
 
 /* ============ شاشة جرد الفروع: تحديد الكمية الفعلية لكل صنف بفرع معيّن، ومقارنتها بالمتوقع، وإرسال إشعار نقص ============ */
 /* ============ طلب الفرع من المستودع الرئيسي: الشيف/موظف الفرع يطلب أصناف، وأمين المستودع يوافق (كلي/جزئي) أو يرفض ============ */
-function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin }) {
+function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin, canConfirmReceipt }) {
   const [items, setItems] = useState([]);
   const [branch, setBranch] = useState("");
   const [lines, setLines] = useState([]);
@@ -2441,8 +2441,9 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin }) {
   const [myRequests, setMyRequests] = useState([]);
   const [allRequests, setAllRequests] = useState([]);
   const [filterStatus, setFilterStatus] = useState("pending");
-  const [approveQtys, setApproveQtys] = useState({}); // { requestId_lineIdx: qty }
-  const [freshApproval, setFreshApproval] = useState(null); // طلب اتوافق عليه حالًا، عشان نعرض ورقة طباعة فورية
+  const [approveQtys, setApproveQtys] = useState({}); // { requestId_lineIdx: qty } — مرحلة موافقة المدير
+  const [receiveQtys, setReceiveQtys] = useState({}); // { requestId_lineIdx: qty } — مرحلة تأكيد الاستلام
+  const [freshApproval, setFreshApproval] = useState(null); // طلب اتأكد استلامه حالًا، عشان نعرض ورقة طباعة فورية
 
   useEffect(() => {
     const unsub = ITEMS_COL.orderBy("nameAr").onSnapshot((snap) => setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
@@ -2473,7 +2474,7 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin }) {
     setSaving(true); setMsg("");
     try {
       await REQUESTS_COL.add({
-        branch, lines: lines.map((l) => ({ itemId: l.itemId, itemName: l.itemName, itemNameEn: l.itemNameEn, unit: l.unit, qtyRequested: l.qtyRequested, qtyApproved: 0 })),
+        branch, lines: lines.map((l) => ({ itemId: l.itemId, itemName: l.itemName, itemNameEn: l.itemNameEn, unit: l.unit, qtyRequested: l.qtyRequested, qtyApproved: 0, qtyReceived: 0 })),
         note: note.trim(), status: "pending", requestedBy: currentUser.name, institutionId: DEFAULT_INSTITUTION_ID,
         createdAt: firebase.firestore.FieldValue.serverTimestamp(),
       });
@@ -2483,7 +2484,8 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin }) {
     setSaving(false);
   }
 
-  async function approveRequest(req, fulfillAll) {
+  /* ============ المرحلة 1: مسؤول المستودع يوافق على الكميات (بدون أي تحريك فعلي للرصيد) ============ */
+  async function managerApprove(req, fulfillAll) {
     setSaving(true); setMsg("");
     try {
       const finalLines = req.lines.map((l, i) => {
@@ -2491,33 +2493,11 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin }) {
         const q = fulfillAll ? l.qtyRequested : (Number(approveQtys[key]) || 0);
         return { ...l, qtyApproved: q };
       });
-      for (const l of finalLines) {
-        if (l.qtyApproved <= 0) continue;
-        const bsRef = BRANCH_STOCK_COL.doc(branchStockDocId(req.branch, l.itemId));
-        await db.runTransaction(async (tx) => {
-          const ref = ITEMS_COL.doc(l.itemId);
-          const snap = await tx.get(ref);
-          const curQty = Number(snap.data().qty) || 0;
-          tx.update(ref, { qty: curQty - l.qtyApproved });
-          const bsSnap = await tx.get(bsRef);
-          const curBranchQty = bsSnap.exists ? (Number(bsSnap.data().qty) || 0) : 0;
-          tx.set(bsRef, { branch: req.branch, itemId: l.itemId, itemName: l.itemName, qty: curBranchQty + l.qtyApproved, institutionId: DEFAULT_INSTITUTION_ID }, { merge: true });
-          tx.set(MOVES_COL.doc(), {
-            itemId: l.itemId, itemName: l.itemName, itemNameEn: l.itemNameEn, unit: l.unit,
-            type: "out", qty: l.qtyApproved, branch: req.branch, date: todayStr(),
-            note: t("تنفيذ طلب فرع", "Branch request fulfillment") + " #" + req.id.slice(0, 6),
-            enteredBy: currentUser.name, institutionId: DEFAULT_INSTITUTION_ID,
-            createdAt: firebase.firestore.FieldValue.serverTimestamp(),
-          });
-        });
-      }
-      const allFulfilled = finalLines.every((l) => l.qtyApproved >= l.qtyRequested);
       await REQUESTS_COL.doc(req.id).update({
-        lines: finalLines, status: allFulfilled ? "approved" : "partial",
-        reviewedBy: currentUser.name, reviewedAt: firebase.firestore.FieldValue.serverTimestamp(),
+        lines: finalLines, status: "awaiting_receipt",
+        managerApprovedBy: currentUser.name, managerApprovedAt: firebase.firestore.FieldValue.serverTimestamp(),
       });
-      setMsg("✅ " + t("تم تنفيذ الطلب وصرف الأصناف للفرع", "Request fulfilled and items issued to the branch"));
-      setFreshApproval({ ...req, lines: finalLines, reviewedBy: currentUser.name, reviewedAtDate: todayStr() });
+      setMsg("✅ " + t("تمت الموافقة — الطلب دلوقتي بانتظار تأكيد الفرع المستلم", "Approved — the request now awaits the receiving branch's confirmation"));
     } catch (e) { setMsg("Error: " + e.message); }
     setSaving(false);
   }
@@ -2527,8 +2507,55 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin }) {
     await REQUESTS_COL.doc(req.id).update({ status: "rejected", reviewedBy: currentUser.name, reviewedAt: firebase.firestore.FieldValue.serverTimestamp() });
   }
 
-  const STATUS_LABEL = { pending: t("قيد المراجعة", "Pending"), approved: t("تم التنفيذ بالكامل", "Fully fulfilled"), partial: t("تم التنفيذ جزئيًا", "Partially fulfilled"), rejected: t("مرفوض", "Rejected") };
-  const STATUS_COLOR = { pending: C.warn, approved: C.success, partial: "#a16207", rejected: C.danger };
+  /* ============ المرحلة 2: الفرع المستلم يأكّد الاستلام (وله حق يعدّل الكمية)، وهنا بس الرصيد بيتحرّك فعليًا ============ */
+  async function confirmReceipt(req) {
+    setSaving(true); setMsg("");
+    try {
+      const finalLines = req.lines.map((l, i) => {
+        const key = req.id + "_" + i;
+        const entered = receiveQtys[key];
+        const q = entered !== undefined && entered !== "" ? Number(entered) || 0 : l.qtyApproved;
+        return { ...l, qtyReceived: q };
+      });
+      for (const l of finalLines) {
+        if (l.qtyReceived <= 0) continue;
+        const bsRef = BRANCH_STOCK_COL.doc(branchStockDocId(req.branch, l.itemId));
+        await db.runTransaction(async (tx) => {
+          const ref = ITEMS_COL.doc(l.itemId);
+          const snap = await tx.get(ref);
+          const curQty = Number(snap.data().qty) || 0;
+          tx.update(ref, { qty: curQty - l.qtyReceived });
+          const bsSnap = await tx.get(bsRef);
+          const curBranchQty = bsSnap.exists ? (Number(bsSnap.data().qty) || 0) : 0;
+          tx.set(bsRef, { branch: req.branch, itemId: l.itemId, itemName: l.itemName, qty: curBranchQty + l.qtyReceived, institutionId: DEFAULT_INSTITUTION_ID }, { merge: true });
+          tx.set(MOVES_COL.doc(), {
+            itemId: l.itemId, itemName: l.itemName, itemNameEn: l.itemNameEn, unit: l.unit,
+            type: "out", qty: l.qtyReceived, branch: req.branch, date: todayStr(),
+            note: t("تنفيذ طلب فرع (بعد تأكيد الاستلام)", "Branch request fulfillment (after receipt confirmation)") + " #" + req.id.slice(0, 6),
+            enteredBy: currentUser.name, institutionId: DEFAULT_INSTITUTION_ID,
+            createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+          });
+        });
+      }
+      const allFulfilled = finalLines.every((l) => l.qtyReceived >= l.qtyRequested);
+      await REQUESTS_COL.doc(req.id).update({
+        lines: finalLines, status: allFulfilled ? "approved" : "partial",
+        reviewedBy: currentUser.name, reviewedAt: firebase.firestore.FieldValue.serverTimestamp(),
+      });
+      setMsg("✅ " + t("تم تأكيد الاستلام وتحديث الرصيد", "Receipt confirmed and stock updated"));
+      setFreshApproval({ ...req, lines: finalLines, reviewedBy: currentUser.name, reviewedAtDate: todayStr() });
+    } catch (e) { setMsg("Error: " + e.message); }
+    setSaving(false);
+  }
+
+  const STATUS_LABEL = {
+    pending: t("قيد مراجعة المستودع", "Pending warehouse review"),
+    awaiting_receipt: t("بانتظار تأكيد الاستلام من الفرع", "Awaiting branch receipt confirmation"),
+    approved: t("تم الاستلام بالكامل", "Fully received"),
+    partial: t("تم الاستلام جزئيًا", "Partially received"),
+    rejected: t("مرفوض", "Rejected"),
+  };
+  const STATUS_COLOR = { pending: C.warn, awaiting_receipt: "#7c3aed", approved: C.success, partial: "#a16207", rejected: C.danger };
 
   const displayedRequests = isWhAdmin ? allRequests.filter((r) => filterStatus === "all" || r.status === filterStatus) : myRequests;
 
@@ -2584,8 +2611,8 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin }) {
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 14 }}>
           <div style={{ ...cardTitle, marginBottom: 0, border: "none", padding: 0 }}>🕒 {isWhAdmin ? t("كل طلبات الفروع", "All branch requests") : t("طلباتي السابقة", "My previous requests")}</div>
           {isWhAdmin && (
-            <div style={{ display: "flex", gap: 8 }}>
-              {["pending", "approved", "partial", "rejected", "all"].map((s) => (
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              {["pending", "awaiting_receipt", "approved", "partial", "rejected", "all"].map((s) => (
                 <button key={s} onClick={() => setFilterStatus(s)} style={filterStatus === s ? smallBtn : ghostBtn}>{s === "all" ? t("الكل", "All") : STATUS_LABEL[s]}</button>
               ))}
             </div>
@@ -2593,7 +2620,7 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin }) {
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
           {displayedRequests.map((r) => (
-            <div key={r.id} style={{ border: "1px solid " + C.border, borderRadius: 10, padding: 14 }}>
+            <div key={r.id} style={{ border: "1px solid " + (r.status === "awaiting_receipt" ? "#ddd6fe" : C.border), background: r.status === "awaiting_receipt" ? "#faf5ff" : "#fff", borderRadius: 10, padding: 14 }}>
               <div style={{ display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 8, marginBottom: 8 }}>
                 <div>
                   <span style={{ fontWeight: 800, color: C.navy }}>{r.branch}</span>
@@ -2602,17 +2629,25 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin }) {
                 <span style={{ fontWeight: 700, color: STATUS_COLOR[r.status] }}>{STATUS_LABEL[r.status]}</span>
               </div>
               <table>
-                <thead><tr><th style={th}>{t("الصنف", "Item")}</th><th style={th}>{t("المطلوب", "Requested")}</th>{r.status !== "pending" && <th style={th}>{t("المنفَّذ", "Fulfilled")}</th>}{isWhAdmin && r.status === "pending" && <th style={th}>{t("كمية الموافقة", "Approve qty")}</th>}</tr></thead>
+                <thead><tr>
+                  <th style={th}>{t("الصنف", "Item")}</th><th style={th}>{t("المطلوب", "Requested")}</th>
+                  {(r.status === "awaiting_receipt" || r.status === "approved" || r.status === "partial") && <th style={th}>{t("وافق عليه المستودع", "Warehouse approved")}</th>}
+                  {(r.status === "approved" || r.status === "partial") && <th style={th}>{t("المستلم فعليًا", "Actually received")}</th>}
+                  {isWhAdmin && r.status === "pending" && <th style={th}>{t("كمية الموافقة", "Approve qty")}</th>}
+                  {canConfirmReceipt && r.status === "awaiting_receipt" && <th style={th}>{t("الكمية المستلمة فعليًا", "Actual received qty")}</th>}
+                </tr></thead>
                 <tbody>
                   {r.lines.map((l, i) => (
                     <tr key={i}>
                       <td style={td}>{lang === "ar" ? l.itemName : (l.itemNameEn || l.itemName)}</td>
                       <td style={td}>{fmt(l.qtyRequested)} {l.unit}</td>
-                      {r.status !== "pending" && <td style={{ ...td, color: l.qtyApproved >= l.qtyRequested ? C.success : C.warn, fontWeight: 700 }}>{fmt(l.qtyApproved)}</td>}
+                      {(r.status === "awaiting_receipt" || r.status === "approved" || r.status === "partial") && <td style={td}>{fmt(l.qtyApproved)}</td>}
+                      {(r.status === "approved" || r.status === "partial") && <td style={{ ...td, color: l.qtyReceived >= l.qtyRequested ? C.success : C.warn, fontWeight: 700 }}>{fmt(l.qtyReceived)}</td>}
                       {isWhAdmin && r.status === "pending" && (
-                        <td style={td}>
-                          <input type="number" step="0.01" placeholder={String(l.qtyRequested)} onChange={(e) => setApproveQtys((a) => ({ ...a, [r.id + "_" + i]: e.target.value }))} style={{ ...inputStyle2, width: 100 }} />
-                        </td>
+                        <td style={td}><input type="number" step="0.01" placeholder={String(l.qtyRequested)} onChange={(e) => setApproveQtys((a) => ({ ...a, [r.id + "_" + i]: e.target.value }))} style={{ ...inputStyle2, width: 100 }} /></td>
+                      )}
+                      {canConfirmReceipt && r.status === "awaiting_receipt" && (
+                        <td style={td}><input type="number" step="0.01" placeholder={String(l.qtyApproved)} onChange={(e) => setReceiveQtys((a) => ({ ...a, [r.id + "_" + i]: e.target.value }))} style={{ ...inputStyle2, width: 100 }} /></td>
                       )}
                     </tr>
                   ))}
@@ -2620,11 +2655,21 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin }) {
               </table>
               {r.note && <div style={{ fontSize: 12, color: C.muted, marginTop: 6 }}>{t("ملاحظة:", "Note:")} {r.note}</div>}
               {isWhAdmin && r.status === "pending" && (
-                <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
-                  <button onClick={() => approveRequest(r, true)} disabled={saving} style={smallBtn}>✅ {t("موافقة كاملة (الكميات المطلوبة كلها)", "Approve fully (all requested quantities)")}</button>
-                  <button onClick={() => approveRequest(r, false)} disabled={saving} style={ghostBtn}>{t("موافقة بالكميات المكتوبة فوق", "Approve with amounts entered above")}</button>
+                <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+                  <button onClick={() => managerApprove(r, true)} disabled={saving} style={smallBtn}>✅ {t("موافقة كاملة (الكميات المطلوبة كلها)", "Approve fully (all requested quantities)")}</button>
+                  <button onClick={() => managerApprove(r, false)} disabled={saving} style={ghostBtn}>{t("موافقة بالكميات المكتوبة فوق", "Approve with amounts entered above")}</button>
                   <button onClick={() => rejectRequest(r)} style={{ ...ghostBtn, color: C.danger, borderColor: C.danger }}>{t("رفض", "Reject")}</button>
                 </div>
+              )}
+              {r.status === "awaiting_receipt" && (
+                canConfirmReceipt ? (
+                  <div style={{ marginTop: 10 }}>
+                    <div style={{ fontSize: 11.5, color: "#7c3aed", marginBottom: 8 }}>{t("تقدر تعدّل الكمية لو استلمت أقل من الموافَق عليه، وبعدين أكّد.", "You can adjust the quantity if you received less than approved, then confirm.")}</div>
+                    <button onClick={() => confirmReceipt(r)} disabled={saving} style={smallBtn}>✅ {t("تأكيد استلام الفرع", "Confirm branch receipt")}</button>
+                  </div>
+                ) : (
+                  <div style={{ fontSize: 12, color: C.muted, marginTop: 8 }}>{t("بانتظار تأكيد الفرع المستلم — الرصيد هيتحرّك بعد التأكيد.", "Awaiting the receiving branch's confirmation — stock will move once confirmed.")}</div>
+                )
               )}
             </div>
           ))}
@@ -3680,7 +3725,11 @@ function App() {
         {effectiveTab === "dashboard" && canManageWarehouse(currentUser, whMeta) && <WarehouseDashboard lang={lang} t={t} setTab={setTab} meta={meta} currentUser={currentUser} whMeta={whMeta} />}
         {effectiveTab === "in" && canManageWarehouse(currentUser, whMeta) && <StockInTab currentUser={currentUser} lang={lang} t={t} />}
         {effectiveTab === "out" && <StockOutTab currentUser={currentUser} meta={meta} lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
-        {effectiveTab === "branchRequest" && <BranchRequestTab currentUser={currentUser} meta={meta} lang={lang} t={t} isWhAdmin={canRequestForBranch(currentUser, whMeta)} />}
+        {effectiveTab === "branchRequest" && (
+          <BranchRequestTab currentUser={currentUser} meta={meta} lang={lang} t={t}
+            isWhAdmin={canRequestForBranch(currentUser, whMeta) && !getUserEntityRestriction(currentUser, whMeta)}
+            canConfirmReceipt={canRequestForBranch(currentUser, whMeta)} />
+        )}
         {effectiveTab === "quickscan" && <QuickScanTab currentUser={currentUser} meta={meta} lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
         {effectiveTab === "mainCount" && canManageWarehouse(currentUser, whMeta) && <MainWarehouseCountTab currentUser={currentUser} meta={meta} lang={lang} t={t} />}
         {effectiveTab === "count" && <BranchCountTab currentUser={currentUser} meta={meta} lang={lang} t={t} />}
