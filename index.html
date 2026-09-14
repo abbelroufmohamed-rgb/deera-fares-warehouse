@@ -93,6 +93,7 @@ const EQUIPMENT_COL = db.collection("whEquipment"); // معدات المستود
 const PURCHASE_REQUESTS_COL = db.collection("whPurchaseRequests"); // طلبات شراء منتجات خارجية جديدة (اسم + صورة، قبل ما تتسجّل كصنف رسمي)
 const MAINTENANCE_COL = db.collection("whMaintenance"); // سجل صيانة كل معدة
 const EQUIPMENT_MOVES_COL = db.collection("whEquipmentMoves"); // حركات نقل المعدات (لفرع/للصيانة/عودة للمستودع)
+const MAINTENANCE_REQUESTS_COL = db.collection("whMaintenanceRequests"); // طلبات صيانة (بلاغ عطل) توصل للمسؤول
 
 const ROLE_LABELS = {
   admin: "أدمن", financial_manager: "مدير مالي", accountant: "محاسب",
@@ -108,7 +109,9 @@ function getWarehouseRole(currentUser, whMeta) {
 }
 function canManageWarehouse(currentUser, whMeta) { return getWarehouseRole(currentUser, whMeta) === "wh_admin"; }
 function canRequestForBranch(currentUser, whMeta) { const r = getWarehouseRole(currentUser, whMeta); return r === "wh_admin" || r === "wh_staff"; }
-const WAREHOUSE_ROLE_LABELS = { wh_admin: "مدير مستودع", wh_staff: "موظف مستودع" };
+function isMaintenanceResponsible(currentUser, whMeta) { const r = getWarehouseRole(currentUser, whMeta); return r === "wh_admin" || r === "wh_maintenance"; }
+function isMaintenanceOnly(currentUser, whMeta) { return getWarehouseRole(currentUser, whMeta) === "wh_maintenance"; }
+const WAREHOUSE_ROLE_LABELS = { wh_admin: "مدير مستودع", wh_staff: "موظف مستودع", wh_maintenance: "مسؤول صيانة" };
 /* لو الموظف مقيّد بكيان معيّن (whMeta.userEntity)، بيشوف بضاعة هذا الكيان بس — فاضي/غير موجود = يشوف كل الكيانات */
 function getUserEntityRestriction(currentUser, whMeta) {
   const map = (whMeta && whMeta.userEntity) || {};
@@ -736,6 +739,7 @@ function WarehouseSettingsTab({ meta, whMeta, users, t }) {
                       <option value="">{t("بدون صلاحية مستودع", "No warehouse access")}</option>
                       <option value="wh_admin">{t("مدير مستودع", "Warehouse manager")}</option>
                       <option value="wh_staff">{t("موظف مستودع", "Warehouse staff")}</option>
+                      <option value="wh_maintenance">{t("مسؤول صيانة فقط", "Maintenance responsible only")}</option>
                     </select>
                   </td>
                   <td style={td}>
@@ -1103,6 +1107,143 @@ function ExternalPurchaseRequestTab({ currentUser, meta, lang, t, isWhAdmin }) {
             </div>
           ))}
           {filtered.length === 0 && <div style={{ color: "#9ca3af", fontSize: 13, textAlign: "center" }}>{t("لا يوجد طلبات", "No requests")}</div>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============ طلب صيانة: أي حد يبلّغ عن عطل في معدة، والطلب يوصل للمسؤول (مدير المستودع) عشان يتابعه لحد ما يتقفل ============ */
+function MaintenanceRequestTab({ currentUser, lang, t, isResponsible }) {
+  const [equipment, setEquipment] = useState([]);
+  const [requests, setRequests] = useState([]);
+  const [equipmentId, setEquipmentId] = useState("");
+  const [issue, setIssue] = useState("");
+  const [urgency, setUrgency] = useState("normal");
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [filterStatus, setFilterStatus] = useState("pending");
+  const [assignInputs, setAssignInputs] = useState({}); // { requestId: assignedToText }
+  const [busyId, setBusyId] = useState(null);
+
+  useEffect(() => {
+    const unsub = EQUIPMENT_COL.orderBy("name").onSnapshot((snap) => setEquipment(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
+    return unsub;
+  }, []);
+  useEffect(() => {
+    const unsub = MAINTENANCE_REQUESTS_COL.orderBy("createdAt", "desc").limit(150).onSnapshot((snap) => setRequests(snap.docs.map((d) => ({ id: d.id, ...d.data() }))), () => {});
+    return unsub;
+  }, []);
+
+  const URGENCY_LABEL = { normal: t("عادي", "Normal"), urgent: t("عاجل", "Urgent") };
+  const STATUS_LABEL = { pending: t("قيد الانتظار", "Pending"), in_progress: t("جارِ التنفيذ", "In progress"), done: t("تم الإصلاح", "Resolved"), rejected: t("مرفوض", "Rejected") };
+  const STATUS_COLOR = { pending: C.warn, in_progress: C.blue, done: C.success, rejected: C.danger };
+
+  async function submitRequest() {
+    const eq = equipment.find((e) => e.id === equipmentId);
+    if (!eq) { setMsg(t("اختر المعدة أولًا", "Choose the equipment first")); return; }
+    if (!issue.trim()) { setMsg(t("اكتب وصف العطل/المشكلة", "Describe the fault/issue")); return; }
+    setSaving(true); setMsg("");
+    try {
+      await MAINTENANCE_REQUESTS_COL.add({
+        equipmentId: eq.id, equipmentName: eq.name, equipmentLocation: eq.currentLocation || eq.branch || t("المستودع الرئيسي", "Main Warehouse"),
+        issue: issue.trim(), urgency, status: "pending", requestedBy: currentUser.name, assignedTo: "",
+        institutionId: DEFAULT_INSTITUTION_ID, createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+      });
+      setEquipmentId(""); setIssue(""); setUrgency("normal");
+      setMsg("✅ " + t("تم إرسال بلاغ الصيانة للمسؤول", "Maintenance report sent to the responsible person"));
+    } catch (e) { setMsg("Error: " + e.message); }
+    setSaving(false);
+  }
+
+  async function updateStatus(r, status) {
+    setBusyId(r.id);
+    try {
+      const payload = { status };
+      if (status === "in_progress") payload.assignedTo = (assignInputs[r.id] || "").trim() || currentUser.name;
+      if (status === "done" || status === "rejected") payload.resolvedAt = firebase.firestore.FieldValue.serverTimestamp();
+      await MAINTENANCE_REQUESTS_COL.doc(r.id).update(payload);
+      // لو اتقفل كـ"تم الإصلاح"، نسجّله تلقائيًا في سجل صيانة المعدة الرسمي
+      if (status === "done") {
+        await MAINTENANCE_COL.add({
+          equipmentId: r.equipmentId, date: todayStr(), description: r.issue, cost: 0,
+          performedBy: r.assignedTo || currentUser.name, institutionId: DEFAULT_INSTITUTION_ID, createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+        });
+      }
+    } catch (e) { setMsg("Error: " + e.message); }
+    setBusyId(null);
+  }
+
+  const filtered = requests.filter((r) => filterStatus === "all" || r.status === filterStatus);
+  const pendingCount = requests.filter((r) => r.status === "pending").length;
+
+  return (
+    <div>
+      <div style={cardStyle}>
+        <div style={cardTitle}>🔧📋 {t("الإبلاغ عن عطل / طلب صيانة", "Report a Fault / Maintenance Request")}</div>
+        <div style={{ fontSize: 12.5, color: C.muted, marginBottom: 14 }}>{t("لو معدة عندها عطل أو محتاجة صيانة، بلّغ عنها هنا وهيوصل للمسؤول مباشرة.", "If a piece of equipment has a fault or needs maintenance, report it here and it goes straight to the responsible person.")}</div>
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-end" }}>
+          <div style={{ flex: "1 1 220px" }}>
+            <label style={smallLabel}>{t("المعدة", "Equipment")}</label>
+            <select value={equipmentId} onChange={(e) => setEquipmentId(e.target.value)} style={inputStyle2}>
+              <option value="">{t("اختر المعدة", "Choose equipment")}</option>
+              {equipment.map((eq) => <option key={eq.id} value={eq.id}>{eq.name} ({eq.currentLocation || eq.branch || t("المستودع الرئيسي", "Main WH")})</option>)}
+            </select>
+          </div>
+          <div>
+            <label style={smallLabel}>{t("الأولوية", "Priority")}</label>
+            <select value={urgency} onChange={(e) => setUrgency(e.target.value)} style={inputStyle2}>
+              <option value="normal">{t("عادي", "Normal")}</option>
+              <option value="urgent">{t("عاجل", "Urgent")}</option>
+            </select>
+          </div>
+          <div style={{ flex: "1 1 260px" }}>
+            <label style={smallLabel}>{t("وصف العطل/المشكلة", "Fault/issue description")}</label>
+            <input value={issue} onChange={(e) => setIssue(e.target.value)} style={inputStyle2} placeholder={t("مثال: الماكينة بتسخّن كتير ومش بتضبط الضغط", "e.g. machine overheats and won't hold pressure")} />
+          </div>
+          <button onClick={submitRequest} disabled={saving} style={smallBtn}>{saving ? t("جارِ الإرسال...", "Sending...") : "📤 " + t("إرسال البلاغ", "Send report")}</button>
+        </div>
+        {msg && <div style={{ marginTop: 10, fontSize: 13.5, color: msg.startsWith("✅") ? C.success : C.danger }}>{msg}</div>}
+      </div>
+
+      <div style={cardStyle}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 14 }}>
+          <div style={{ ...cardTitle, marginBottom: 0, border: "none", padding: 0 }}>🕒 {t("بلاغات الصيانة", "Maintenance Reports")} {pendingCount > 0 && <span style={{ background: C.danger, color: "#fff", borderRadius: 20, padding: "2px 10px", fontSize: 12, marginRight: 8 }}>{pendingCount} {t("قيد الانتظار", "pending")}</span>}</div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            {["pending", "in_progress", "done", "rejected", "all"].map((s) => (
+              <button key={s} onClick={() => setFilterStatus(s)} style={filterStatus === s ? smallBtn : ghostBtn}>{s === "all" ? t("الكل", "All") : STATUS_LABEL[s]}</button>
+            ))}
+          </div>
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {filtered.map((r) => (
+            <div key={r.id} style={{
+              border: "1px solid " + (r.urgency === "urgent" && r.status === "pending" ? "#fecaca" : C.border), borderRadius: 10, padding: 14,
+              background: r.urgency === "urgent" && r.status === "pending" ? "#fef2f2" : "#fff",
+            }}>
+              <div style={{ display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 8, marginBottom: 6 }}>
+                <div>
+                  <span style={{ fontWeight: 800, color: C.navy }}>{r.equipmentName}</span>
+                  {r.urgency === "urgent" && <span style={{ marginRight: 8, background: C.danger, color: "#fff", borderRadius: 12, padding: "2px 8px", fontSize: 11, fontWeight: 700 }}>⚡ {t("عاجل", "Urgent")}</span>}
+                  <div style={{ fontSize: 12, color: C.muted }}>📍 {r.equipmentLocation} — {t("بلّغ عنه:", "Reported by:")} {r.requestedBy}</div>
+                </div>
+                <span style={{ fontWeight: 700, color: STATUS_COLOR[r.status] }}>{STATUS_LABEL[r.status]}</span>
+              </div>
+              <div style={{ fontSize: 13.5, color: C.text, marginBottom: 8 }}>{r.issue}</div>
+              {r.assignedTo && <div style={{ fontSize: 12, color: C.muted, marginBottom: 8 }}>{t("مسؤول عنها:", "Assigned to:")} {r.assignedTo}</div>}
+              {isResponsible && r.status === "pending" && (
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                  <input value={assignInputs[r.id] || ""} onChange={(e) => setAssignInputs((a) => ({ ...a, [r.id]: e.target.value }))} placeholder={t("اسم اللي هيتابعها (اختياري)", "Who's handling it (optional)")} style={{ ...inputStyle2, maxWidth: 220 }} />
+                  <button onClick={() => updateStatus(r, "in_progress")} disabled={busyId === r.id} style={smallBtn}>▶️ {t("بدء المعالجة", "Start handling")}</button>
+                  <button onClick={() => updateStatus(r, "rejected")} disabled={busyId === r.id} style={{ ...ghostBtn, color: C.danger, borderColor: C.danger }}>{t("رفض", "Reject")}</button>
+                </div>
+              )}
+              {isResponsible && r.status === "in_progress" && (
+                <button onClick={() => updateStatus(r, "done")} disabled={busyId === r.id} style={smallBtn}>✅ {t("تم الإصلاح", "Mark as resolved")}</button>
+              )}
+            </div>
+          ))}
+          {filtered.length === 0 && <div style={{ color: "#9ca3af", fontSize: 13, textAlign: "center" }}>{t("لا يوجد بلاغات", "No reports")}</div>}
         </div>
       </div>
     </div>
@@ -3219,6 +3360,7 @@ const TAB_DEFS_WH = [
   { id: "purchase", labelAr: "قائمة شراء مقترحة", labelEn: "Suggested Purchase" },
   { id: "expiry", labelAr: "الصلاحية", labelEn: "Expiry" },
   { id: "equipment", labelAr: "🔧 المعدات والصيانة", labelEn: "🔧 Equipment & Maintenance" },
+  { id: "maintenanceRequest", labelAr: "🔧📋 طلب صيانة", labelEn: "🔧📋 Maintenance Request" },
   { id: "externalPurchase", labelAr: "🛒 طلب شراء خارجي", labelEn: "🛒 External Purchase" },
   { id: "suppliers", labelAr: "كشف حساب مورد", labelEn: "Supplier Statement" },
   { id: "branchStatement", labelAr: "📋 كشف حساب فرع", labelEn: "📋 Branch Statement" },
@@ -3494,11 +3636,14 @@ function App() {
   }
   if (!currentUser) return <LoginScreen users={users} onLogin={handleLogin} />;
 
-  const visibleTabs = TAB_DEFS_WH.filter((tb) => {
-    if (["items", "in", "settings", "notifs", "labels", "purchase", "expiry", "suppliers", "dashboard", "equipment", "mainCount", "branchStatement"].includes(tb.id)) return canManageWarehouse(currentUser, whMeta);
-    return true; // out, count, reports, quickscan, branchRequest متاحة لمدير المستودع وموظفه
-  });
-  const effectiveTab = visibleTabs.some((tb) => tb.id === tab) ? tab : (visibleTabs[0]?.id || "out");
+  const maintenanceOnly = isMaintenanceOnly(currentUser, whMeta);
+  const visibleTabs = maintenanceOnly
+    ? TAB_DEFS_WH.filter((tb) => tb.id === "maintenanceRequest") // مسؤول الصيانة يشوف تبويب واحد بس، مفيش أي حاجة تانية
+    : TAB_DEFS_WH.filter((tb) => {
+        if (["items", "in", "settings", "notifs", "labels", "purchase", "expiry", "suppliers", "dashboard", "equipment", "mainCount", "branchStatement"].includes(tb.id)) return canManageWarehouse(currentUser, whMeta);
+        return true; // out, count, reports, quickscan, branchRequest متاحة لمدير المستودع وموظفه
+      });
+  const effectiveTab = visibleTabs.some((tb) => tb.id === tab) ? tab : (visibleTabs[0]?.id || (maintenanceOnly ? "maintenanceRequest" : "out"));
 
   return (
     <div style={{ minHeight: "100vh" }}>
@@ -3544,6 +3689,7 @@ function App() {
         {effectiveTab === "purchase" && canManageWarehouse(currentUser, whMeta) && <SuggestedPurchaseTab lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
         {effectiveTab === "expiry" && canManageWarehouse(currentUser, whMeta) && <ExpiryTab lang={lang} t={t} />}
         {effectiveTab === "equipment" && canManageWarehouse(currentUser, whMeta) && <EquipmentTab currentUser={currentUser} meta={meta} lang={lang} t={t} />}
+        {effectiveTab === "maintenanceRequest" && <MaintenanceRequestTab currentUser={currentUser} lang={lang} t={t} isResponsible={isMaintenanceResponsible(currentUser, whMeta)} />}
         {effectiveTab === "externalPurchase" && <ExternalPurchaseRequestTab currentUser={currentUser} meta={meta} lang={lang} t={t} isWhAdmin={canRequestForBranch(currentUser, whMeta)} />}
         {effectiveTab === "suppliers" && canManageWarehouse(currentUser, whMeta) && <SupplierStatementTab lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
         {effectiveTab === "branchStatement" && canManageWarehouse(currentUser, whMeta) && <BranchStatementTab meta={meta} lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
