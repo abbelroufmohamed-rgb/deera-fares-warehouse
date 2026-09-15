@@ -2599,12 +2599,11 @@ function StockOutTab({ currentUser, meta, lang, t, institutionName }) {
       const bsRef = BRANCH_STOCK_COL.doc(branchStockDocId(branch, selectedItem.id));
       await db.runTransaction(async (tx) => {
         const ref = ITEMS_COL.doc(selectedItem.id);
+        const bsSnap = await tx.get(bsRef); // كل القراءات لازم تحصل قبل أي كتابة في معاملة Firestore
         const snap = await tx.get(ref);
         const curQty = Number(snap.data().qty) || 0;
-        tx.update(ref, { qty: curQty - q });
-
-        const bsSnap = await tx.get(bsRef);
         const curBranchQty = bsSnap.exists ? (Number(bsSnap.data().qty) || 0) : 0;
+        tx.update(ref, { qty: curQty - q });
         tx.set(bsRef, { branch, itemId: selectedItem.id, itemName: selectedItem.nameAr, qty: curBranchQty + q, institutionId: DEFAULT_INSTITUTION_ID }, { merge: true });
 
         const moveRef = MOVES_COL.doc();
@@ -2729,11 +2728,11 @@ function QuickScanTab({ currentUser, meta, lang, t, institutionName }) {
       const bsRef = BRANCH_STOCK_COL.doc(branchStockDocId(branch, pendingItem.id));
       await db.runTransaction(async (tx) => {
         const ref = ITEMS_COL.doc(pendingItem.id);
+        const bsSnap = await tx.get(bsRef); // كل القراءات لازم تحصل قبل أي كتابة في معاملة Firestore
         const snap = await tx.get(ref);
         const curQty = Number(snap.data().qty) || 0;
-        tx.update(ref, { qty: curQty - q });
-        const bsSnap = await tx.get(bsRef);
         const curBranchQty = bsSnap.exists ? (Number(bsSnap.data().qty) || 0) : 0;
+        tx.update(ref, { qty: curQty - q });
         tx.set(bsRef, { branch, itemId: pendingItem.id, itemName: pendingItem.nameAr, qty: curBranchQty + q, institutionId: DEFAULT_INSTITUTION_ID }, { merge: true });
         tx.set(MOVES_COL.doc(), {
           itemId: pendingItem.id, itemName: pendingItem.nameAr, itemNameEn: pendingItem.nameEn, unit: pendingItem.unit,
@@ -2898,11 +2897,11 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin, canConfirmRec
         const bsRef = BRANCH_STOCK_COL.doc(branchStockDocId(req.branch, l.itemId));
         await db.runTransaction(async (tx) => {
           const ref = ITEMS_COL.doc(l.itemId);
+          const bsSnap = await tx.get(bsRef); // كل القراءات لازم تحصل قبل أي كتابة في معاملة Firestore
           const snap = await tx.get(ref);
           const curQty = Number(snap.data().qty) || 0;
-          tx.update(ref, { qty: curQty - l.qtyReceived });
-          const bsSnap = await tx.get(bsRef);
           const curBranchQty = bsSnap.exists ? (Number(bsSnap.data().qty) || 0) : 0;
+          tx.update(ref, { qty: curQty - l.qtyReceived });
           tx.set(bsRef, { branch: req.branch, itemId: l.itemId, itemName: l.itemName, qty: curBranchQty + l.qtyReceived, institutionId: DEFAULT_INSTITUTION_ID }, { merge: true });
           tx.set(MOVES_COL.doc(), {
             itemId: l.itemId, itemName: l.itemName, itemNameEn: l.itemNameEn, unit: l.unit,
