@@ -96,6 +96,8 @@ const EQUIPMENT_MOVES_COL = db.collection("whEquipmentMoves"); // حركات ن�
 const MAINTENANCE_REQUESTS_COL = db.collection("whMaintenanceRequests"); // طلبات صيانة (بلاغ عطل) توصل للمسؤول
 const RECIPES_COL = db.collection("whRecipes"); // ريسبي: كل منتج مباع ومكوّناته من أصناف المستودع بمعيار الوحدة
 const SALES_BATCHES_COL = db.collection("whSalesBatches"); // دفعات مبيعات مرفوعة من فودكس (فرع + فترة)
+const DAMAGE_COL = db.collection("whDamage"); // تسجيل الأصناف التالفة/الهدر وطلب الاستخلاص من المستودع (ممنوع تحويله لأي فرع)
+const PRODUCTION_COL = db.collection("whProduction"); // إنتاجية المطبخ اليومية — كل عملية إنتاج بتخصم مكوّناتها من المستودع تلقائيًا حسب الريسبي
 
 const ROLE_LABELS = {
   admin: "أدمن", financial_manager: "مدير مالي", accountant: "محاسب",
@@ -113,7 +115,8 @@ function canManageWarehouse(currentUser, whMeta) { return getWarehouseRole(curre
 function canRequestForBranch(currentUser, whMeta) { const r = getWarehouseRole(currentUser, whMeta); return r === "wh_admin" || r === "wh_staff"; }
 function isMaintenanceResponsible(currentUser, whMeta) { const r = getWarehouseRole(currentUser, whMeta); return r === "wh_admin" || r === "wh_maintenance"; }
 function isMaintenanceOnly(currentUser, whMeta) { return getWarehouseRole(currentUser, whMeta) === "wh_maintenance"; }
-const WAREHOUSE_ROLE_LABELS = { wh_admin: "مدير مستودع", wh_staff: "موظف مستودع", wh_maintenance: "مسؤول صيانة" };
+function isKitchenOnly(currentUser, whMeta) { return getWarehouseRole(currentUser, whMeta) === "wh_kitchen"; }
+const WAREHOUSE_ROLE_LABELS = { wh_admin: "مدير مستودع", wh_staff: "موظف مستودع", wh_maintenance: "مسؤول صيانة", wh_kitchen: "موظف مطبخ/إنتاج" };
 /* لو الموظف مقيّد بكيان معيّن (whMeta.userEntity)، بيشوف بضاعة هذا الكيان بس — فاضي/غير موجود = يشوف كل الكيانات */
 function getUserEntityRestriction(currentUser, whMeta) {
   const map = (whMeta && whMeta.userEntity) || {};
@@ -145,6 +148,12 @@ function buildBranchGroups(branchTree) {
 function getAllEntityNames(branchTree) {
   const tree = branchTree || [];
   return buildTreeChildren(tree, null).map((root) => root.name);
+}
+/* بيلاقي اسم الكيان (المؤسسة الأب) اللي بيتبعها فرع معيّن، عن طريق شجرة الفروع — يستخدم عشان نعرف أي ريسبي نطبّق على أي فرع تلقائيًا */
+function findEntityForBranch(branchName, branchTree) {
+  const groups = buildBranchGroups(branchTree);
+  const found = groups.find((g) => g.branches.includes(branchName));
+  return found ? found.name : "";
 }
 
 /* بيترسم options مجمّعة تحت المؤسسة (لو فيه شجرة)، أو قائمة عادية لو لسه محدش بنى الشجرة */
@@ -764,6 +773,7 @@ function WarehouseSettingsTab({ meta, whMeta, users, t }) {
                       <option value="wh_admin">{t("مدير مستودع", "Warehouse manager")}</option>
                       <option value="wh_staff">{t("موظف مستودع", "Warehouse staff")}</option>
                       <option value="wh_maintenance">{t("مسؤول صيانة فقط", "Maintenance responsible only")}</option>
+                      <option value="wh_kitchen">{t("موظف مطبخ/إنتاج فقط", "Kitchen/production staff only")}</option>
                     </select>
                   </td>
                   <td style={td}>
@@ -1138,17 +1148,262 @@ function ExternalPurchaseRequestTab({ currentUser, meta, lang, t, isWhAdmin }) {
 }
 
 /* ============ طلب صيانة: أي حد يبلّغ عن عطل في معدة، والطلب يوصل للمسؤول (مدير المستودع) عشان يتابعه لحد ما يتقفل ============ */
-/* ============ إدارة الريسبي: كل منتج مباع (زي "كوب قهوة بارد") ومكوّناته من أصناف المستودع بالكمية المعيارية لكل وحدة ============ */
-function RecipesTab({ lang, t }) {
+/* ============ إدارة الريسبي: كل منتج مباع (زي "كوب قهوة بارد") ومكوّناته من أصناف المستودع بالكمية المعيارية لكل وحدة ============
+   كل ريسبي مربوط بكيان معيّن (ريشيو/24/مسكوب) — نفس المنتج ممكن يكون له ريسبي مختلف في كل كيان */
+/* ============ منطقة التالف/الهدر: تسجيل مواد تالفة وطلب استخلاصها (شطبها) من رصيد المستودع — ممنوع تحويلها لأي فرع خالص ============ */
+/* ============ الإنتاجية اليومية: موظف المطبخ يسجّل كام وحدة أنتج من كل منتج له ريسبي، والنظام يخصم المكوّنات من المستودع تلقائيًا ============ */
+function ProductionTab({ currentUser, meta, lang, t, whMeta }) {
+  const [recipes, setRecipes] = useState([]);
+  const [log, setLog] = useState([]);
+  const [selectedRecipeId, setSelectedRecipeId] = useState("");
+  const [qtyProduced, setQtyProduced] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState("");
+
+  const restrictedEntity = getUserEntityRestriction(currentUser, whMeta);
+
+  useEffect(() => {
+    const unsub = RECIPES_COL.orderBy("productName").onSnapshot((snap) => setRecipes(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
+    return unsub;
+  }, []);
+  useEffect(() => {
+    const unsub = PRODUCTION_COL.where("producedBy", "==", currentUser.name).orderBy("createdAt", "desc").limit(30).onSnapshot(
+      (snap) => setLog(snap.docs.map((d) => ({ id: d.id, ...d.data() }))), () => {}
+    );
+    return unsub;
+  }, [currentUser.name]);
+
+  // موظف المطبخ يشوف بس ريسبيهات كيانه (لو مقيّد بكيان)، أو كل الريسبيهات لو مش مقيّد
+  const myRecipes = restrictedEntity ? recipes.filter((r) => (r.institution || "") === restrictedEntity) : recipes;
+  const selectedRecipe = myRecipes.find((r) => r.id === selectedRecipeId);
+
+  async function submitProduction() {
+    const q = Number(qtyProduced);
+    if (!selectedRecipe) { setMsg(t("اختر المنتج اللي أنتجته", "Choose the product you produced")); return; }
+    if (!q || q <= 0) { setMsg(t("أدخل كمية صحيحة أكبر من صفر", "Enter a quantity greater than zero")); return; }
+    setSaving(true); setMsg("");
+    try {
+      for (const ing of selectedRecipe.ingredients) {
+        const consumeQty = ing.qtyPerUnit * q;
+        await db.runTransaction(async (tx) => {
+          const ref = ITEMS_COL.doc(ing.itemId);
+          const snap = await tx.get(ref); // القراءة لازم تحصل قبل أي كتابة
+          const curQty = Number(snap.data()?.qty) || 0;
+          tx.update(ref, { qty: curQty - consumeQty });
+          tx.set(MOVES_COL.doc(), {
+            itemId: ing.itemId, itemName: ing.itemName, itemNameEn: ing.itemNameEn, unit: ing.unit,
+            type: "out", qty: consumeQty, branch: t("إنتاج مطبخ", "Kitchen Production"), date: todayStr(),
+            note: t("إنتاج:", "Production:") + " " + selectedRecipe.productName + " × " + fmt(q),
+            enteredBy: currentUser.name, institutionId: DEFAULT_INSTITUTION_ID,
+            createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+          });
+        });
+        await depleteBatchesFIFO(ing.itemId, consumeQty);
+      }
+      await PRODUCTION_COL.add({
+        productName: selectedRecipe.productName, institution: selectedRecipe.institution || "", qtyProduced: q, date: todayStr(),
+        producedBy: currentUser.name, ingredientsUsed: selectedRecipe.ingredients.map((i) => ({ itemName: i.itemName, qty: i.qtyPerUnit * q, unit: i.unit })),
+        institutionId: DEFAULT_INSTITUTION_ID, createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+      });
+      setSelectedRecipeId(""); setQtyProduced("");
+      setMsg("✅ " + t(`تم تسجيل إنتاج ${fmt(q)} من "${selectedRecipe.productName}" وخصم المكوّنات من المستودع`, `Production of ${fmt(q)} "${selectedRecipe.productName}" logged and ingredients deducted from stock`));
+    } catch (e) { setMsg("Error: " + e.message); }
+    setSaving(false);
+  }
+
+  return (
+    <div>
+      <div style={cardStyle}>
+        <div style={cardTitle}>🍳 {t("تسجيل الإنتاجية اليومية", "Log Daily Production")}</div>
+        {restrictedEntity && <div style={{ fontSize: 12, color: C.blue, fontWeight: 700, marginBottom: 10 }}>🏢 {t(`شغّال على ريسبيهات كيان "${restrictedEntity}" بس`, `Working on "${restrictedEntity}" entity recipes only`)}</div>}
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-end" }}>
+          <div style={{ flex: "1 1 260px" }}>
+            <label style={smallLabel}>{t("المنتج اللي أنتجته", "Product you produced")}</label>
+            <select value={selectedRecipeId} onChange={(e) => setSelectedRecipeId(e.target.value)} style={inputStyle2}>
+              <option value="">{t("اختر منتج", "Choose product")}</option>
+              {myRecipes.map((r) => <option key={r.id} value={r.id}>{r.productName}</option>)}
+            </select>
+          </div>
+          <div style={{ flex: "1 1 140px" }}>
+            <label style={smallLabel}>{t("الكمية المنتجة اليوم", "Quantity produced today")}</label>
+            <input type="number" step="0.01" value={qtyProduced} onChange={(e) => setQtyProduced(e.target.value)} style={inputStyle2} />
+          </div>
+          <button onClick={submitProduction} disabled={saving} style={smallBtn}>{saving ? t("جارِ الحفظ...", "Saving...") : "✅ " + t("تسجيل الإنتاج", "Log production")}</button>
+        </div>
+        {selectedRecipe && (
+          <div style={{ marginTop: 14, background: C.blueSoft, borderRadius: 8, padding: 12 }}>
+            <div style={{ fontWeight: 700, fontSize: 12.5, color: C.navy, marginBottom: 6 }}>{t("المكوّنات اللي هتتخصم من المستودع (لكل وحدة واحدة):", "Ingredients that will be deducted from stock (per single unit):")}</div>
+            <div style={{ fontSize: 12.5, color: C.muted }}>
+              {selectedRecipe.ingredients.map((i) => `${lang === "ar" ? i.itemName : (i.itemNameEn || i.itemName)} (${fmt(i.qtyPerUnit)} ${i.unit})`).join(" + ")}
+            </div>
+          </div>
+        )}
+        {myRecipes.length === 0 && <div style={{ marginTop: 14, fontSize: 13, color: "#9ca3af", textAlign: "center" }}>{t("لا يوجد ريسبيهات متاحة لك حاليًا — اطلب من مدير المستودع يضيفها.", "No recipes available for you yet — ask the warehouse manager to add them.")}</div>}
+        {msg && <div style={{ marginTop: 10, fontSize: 13.5, color: msg.startsWith("✅") ? C.success : C.danger }}>{msg}</div>}
+      </div>
+
+      <div style={cardStyle}>
+        <div style={cardTitle}>🕒 {t("سجل إنتاجيتي السابقة", "My Previous Production Log")}</div>
+        <table>
+          <thead><tr><th style={th}>{t("التاريخ", "Date")}</th><th style={th}>{t("المنتج", "Product")}</th><th style={th}>{t("الكمية", "Qty")}</th></tr></thead>
+          <tbody>
+            {log.map((p) => (
+              <tr key={p.id}><td style={td}>{p.date}</td><td style={{ ...td, fontWeight: 700 }}>{p.productName}</td><td style={td}>{fmt(p.qtyProduced)}</td></tr>
+            ))}
+            {log.length === 0 && <tr><td colSpan={3} style={{ ...td, textAlign: "center", color: "#9ca3af" }}>{t("لا يوجد إنتاج مسجّل بعد", "No production logged yet")}</td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function DamageWasteTab({ currentUser, meta, lang, t, isWhAdmin }) {
+  const [items, setItems] = useState([]);
+  const [records, setRecords] = useState([]);
+  const [selectedItem, setSelectedItem] = useState(null);
+  const [qty, setQty] = useState("");
+  const [reason, setReason] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [filterStatus, setFilterStatus] = useState("pending");
+  const [busyId, setBusyId] = useState(null);
+
+  useEffect(() => {
+    const unsub = ITEMS_COL.orderBy("nameAr").onSnapshot((snap) => setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
+    return unsub;
+  }, []);
+  useEffect(() => {
+    const unsub = DAMAGE_COL.orderBy("createdAt", "desc").limit(150).onSnapshot((snap) => setRecords(snap.docs.map((d) => ({ id: d.id, ...d.data() }))), () => {});
+    return unsub;
+  }, []);
+
+  const STATUS_LABEL = { pending: t("قيد المراجعة", "Pending review"), approved: t("تم الاستخلاص من المخزون", "Written off from stock"), rejected: t("مرفوض", "Rejected") };
+  const STATUS_COLOR = { pending: C.warn, approved: C.success, rejected: C.danger };
+
+  async function submitRecord() {
+    const q = Number(qty);
+    if (!selectedItem) { setMsg(t("اختر الصنف أولًا", "Choose the item first")); return; }
+    if (!q || q <= 0) { setMsg(t("أدخل كمية صحيحة أكبر من صفر", "Enter a quantity greater than zero")); return; }
+    if (!reason.trim()) { setMsg(t("اكتب سبب التلف/الهدر", "Enter the reason for damage/waste")); return; }
+    setSaving(true); setMsg("");
+    try {
+      await DAMAGE_COL.add({
+        itemId: selectedItem.id, itemName: selectedItem.nameAr, itemNameEn: selectedItem.nameEn, unit: selectedItem.unit,
+        qty: q, reason: reason.trim(), status: "pending", registeredBy: currentUser.name,
+        institutionId: DEFAULT_INSTITUTION_ID, createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+      });
+      setSelectedItem(null); setQty(""); setReason("");
+      setMsg("✅ " + t("تم تسجيل الصنف التالف — بانتظار موافقة مسؤول المستودع على الاستخلاص", "Damaged item registered — awaiting warehouse manager approval for write-off"));
+    } catch (e) { setMsg("Error: " + e.message); }
+    setSaving(false);
+  }
+
+  async function approveWriteoff(r) {
+    setBusyId(r.id);
+    try {
+      await db.runTransaction(async (tx) => {
+        const ref = ITEMS_COL.doc(r.itemId);
+        const snap = await tx.get(ref); // كل القراءات لازم تحصل قبل أي كتابة في معاملة Firestore
+        const curQty = Number(snap.data()?.qty) || 0;
+        tx.update(ref, { qty: Math.max(0, curQty - r.qty) });
+        tx.set(MOVES_COL.doc(), {
+          itemId: r.itemId, itemName: r.itemName, itemNameEn: r.itemNameEn, unit: r.unit,
+          type: "out", qty: r.qty, branch: t("تالف/هدر (استخلاص من المخزون)", "Damage/Waste (stock write-off)"), date: todayStr(),
+          note: r.reason, enteredBy: currentUser.name, institutionId: DEFAULT_INSTITUTION_ID,
+          createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+        });
+      });
+      await depleteBatchesFIFO(r.itemId, r.qty);
+      await DAMAGE_COL.doc(r.id).update({ status: "approved", approvedBy: currentUser.name, approvedAt: firebase.firestore.FieldValue.serverTimestamp() });
+      setMsg("✅ " + t("تم استخلاص الكمية من رصيد المستودع", "Quantity written off from warehouse stock"));
+    } catch (e) { setMsg("Error: " + e.message); }
+    setBusyId(null);
+  }
+  async function rejectRecord(r) {
+    if (!confirm(t("هل تريد رفض هذا التسجيل؟", "Reject this record?"))) return;
+    await DAMAGE_COL.doc(r.id).update({ status: "rejected", approvedBy: currentUser.name, approvedAt: firebase.firestore.FieldValue.serverTimestamp() });
+  }
+
+  const filtered = records.filter((r) => filterStatus === "all" || r.status === filterStatus);
+  const pendingCount = records.filter((r) => r.status === "pending").length;
+
+  return (
+    <div>
+      <div style={cardStyle}>
+        <div style={cardTitle}>🗑️ {t("تسجيل صنف تالف/هدر", "Register Damaged/Wasted Item")}</div>
+        <div style={{ fontSize: 12.5, color: C.muted, marginBottom: 14 }}>{t("الأصناف هنا مخصّصة للشطب من المخزون بس — مينفعش أبدًا تتحوّل لأي فرع.", "Items here are only for write-off from stock — they can never be transferred to any branch.")}</div>
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-end" }}>
+          <div style={{ flex: "1 1 240px" }}>
+            <ItemPicker items={items} lang={lang} t={t} onPick={setSelectedItem} selectedItem={selectedItem} />
+          </div>
+          <div style={{ flex: "1 1 120px" }}>
+            <label style={smallLabel}>{t("الكمية التالفة", "Damaged qty")} {selectedItem && `(${selectedItem.unit})`}</label>
+            <input type="number" step="0.01" value={qty} onChange={(e) => setQty(e.target.value)} style={inputStyle2} />
+          </div>
+          <div style={{ flex: "1 1 220px" }}>
+            <label style={smallLabel}>{t("السبب", "Reason")}</label>
+            <input value={reason} onChange={(e) => setReason(e.target.value)} style={inputStyle2} placeholder={t("مثال: انتهت الصلاحية / وقع وانكسر", "e.g. expired / dropped and broke")} />
+          </div>
+          <button onClick={submitRecord} disabled={saving} style={smallBtn}>{saving ? t("جارِ الحفظ...", "Saving...") : "📤 " + t("تسجيل وطلب الاستخلاص", "Register and request write-off")}</button>
+        </div>
+        {msg && <div style={{ marginTop: 10, fontSize: 13.5, color: msg.startsWith("✅") ? C.success : C.danger }}>{msg}</div>}
+      </div>
+
+      <div style={cardStyle}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 14 }}>
+          <div style={{ ...cardTitle, marginBottom: 0, border: "none", padding: 0 }}>🕒 {t("سجل التالف/الهدر", "Damage/Waste Log")} {pendingCount > 0 && <span style={{ background: C.danger, color: "#fff", borderRadius: 20, padding: "2px 10px", fontSize: 12, marginRight: 8 }}>{pendingCount} {t("قيد الانتظار", "pending")}</span>}</div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            {["pending", "approved", "rejected", "all"].map((s) => (
+              <button key={s} onClick={() => setFilterStatus(s)} style={filterStatus === s ? smallBtn : ghostBtn}>{s === "all" ? t("الكل", "All") : STATUS_LABEL[s]}</button>
+            ))}
+          </div>
+        </div>
+        <table>
+          <thead><tr><th style={th}>{t("التاريخ", "Date")}</th><th style={th}>{t("الصنف", "Item")}</th><th style={th}>{t("الكمية", "Qty")}</th><th style={th}>{t("السبب", "Reason")}</th><th style={th}>{t("سجّله", "Registered by")}</th><th style={th}>{t("الحالة", "Status")}</th>{isWhAdmin && <th style={th}></th>}</tr></thead>
+          <tbody>
+            {filtered.map((r) => (
+              <tr key={r.id}>
+                <td style={td}>{r.createdAt && r.createdAt.toDate ? r.createdAt.toDate().toISOString().slice(0, 10) : "—"}</td>
+                <td style={{ ...td, fontWeight: 700 }}>{lang === "ar" ? r.itemName : (r.itemNameEn || r.itemName)}</td>
+                <td style={td}>{fmt(r.qty)} {r.unit}</td>
+                <td style={td}>{r.reason}</td>
+                <td style={td}>{r.registeredBy}</td>
+                <td style={{ ...td, fontWeight: 700, color: STATUS_COLOR[r.status] }}>{STATUS_LABEL[r.status]}</td>
+                {isWhAdmin && (
+                  <td style={td}>
+                    {r.status === "pending" && (
+                      <>
+                        <span onClick={() => approveWriteoff(r)} style={{ cursor: "pointer", color: C.success, fontWeight: 700, marginLeft: 10 }}>{busyId === r.id ? "..." : "✅ " + t("استخلاص من المخزون", "Write off from stock")}</span>
+                        <span onClick={() => rejectRecord(r)} style={{ cursor: "pointer", color: C.danger, fontWeight: 700 }}>{t("رفض", "Reject")}</span>
+                      </>
+                    )}
+                  </td>
+                )}
+              </tr>
+            ))}
+            {filtered.length === 0 && <tr><td colSpan={7} style={{ ...td, textAlign: "center", color: "#9ca3af" }}>{t("لا يوجد سجلات", "No records")}</td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function RecipesTab({ lang, t, meta }) {
   const [recipes, setRecipes] = useState(null);
   const [items, setItems] = useState([]);
   const [productName, setProductName] = useState("");
+  const [entity, setEntity] = useState("");
   const [editingId, setEditingId] = useState(null);
   const [ingredients, setIngredients] = useState([]); // [{ itemId, itemName, unit, qtyPerUnit }]
   const [selectedItem, setSelectedItem] = useState(null);
   const [qtyPerUnit, setQtyPerUnit] = useState("");
   const [msg, setMsg] = useState("");
   const [search, setSearch] = useState("");
+  const [entityFilter, setEntityFilter] = useState("all");
+
+  const entities = getAllEntityNames(meta.branchTree);
 
   useEffect(() => {
     const unsub = RECIPES_COL.orderBy("productName").onSnapshot((snap) => setRecipes(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
@@ -1158,6 +1413,7 @@ function RecipesTab({ lang, t }) {
     const unsub = ITEMS_COL.orderBy("nameAr").onSnapshot((snap) => setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
     return unsub;
   }, []);
+  useEffect(() => { if (!entity && entities.length) setEntity(entities[0]); }, [entities]);
 
   function addIngredient() {
     const q = Number(qtyPerUnit);
@@ -1170,10 +1426,11 @@ function RecipesTab({ lang, t }) {
 
   async function saveRecipe() {
     if (!productName.trim()) { setMsg(t("اكتب اسم المنتج المباع بالظبط زي ما هو مكتوب في فودكس", "Enter the sold product name exactly as it appears in Foodics")); return; }
+    if (entities.length > 0 && !entity) { setMsg(t("اختر الكيان اللي الريسبي ده بتاعه", "Choose which entity this recipe belongs to")); return; }
     if (ingredients.length === 0) { setMsg(t("أضف مكوّن واحد على الأقل", "Add at least one ingredient")); return; }
     try {
       const payload = {
-        productName: productName.trim(),
+        productName: productName.trim(), institution: entity || "",
         ingredients: ingredients.map((i) => ({ itemId: i.itemId, itemName: i.itemName, itemNameEn: i.itemNameEn, unit: i.unit, qtyPerUnit: i.qtyPerUnit })),
       };
       if (editingId) {
@@ -1189,6 +1446,7 @@ function RecipesTab({ lang, t }) {
 
   function editRecipe(r) {
     setProductName(r.productName);
+    setEntity(r.institution || "");
     setIngredients(r.ingredients.map((i) => ({ key: uid(), ...i })));
     setEditingId(r.id);
   }
@@ -1197,16 +1455,29 @@ function RecipesTab({ lang, t }) {
     await RECIPES_COL.doc(r.id).delete();
   }
 
-  const filtered = (recipes || []).filter((r) => r.productName.toLowerCase().includes(search.trim().toLowerCase()));
+  const filtered = (recipes || []).filter((r) => {
+    if (entityFilter !== "all" && (r.institution || "") !== entityFilter) return false;
+    return r.productName.toLowerCase().includes(search.trim().toLowerCase());
+  });
 
   return (
     <div>
       <div style={cardStyle}>
         <div style={cardTitle}>{editingId ? "✏️ " + t("تعديل ريسبي", "Edit recipe") : "➕ " + t("ريسبي جديد", "New recipe")}</div>
-        <div style={{ fontSize: 12.5, color: C.muted, marginBottom: 14 }}>{t("اكتب اسم المنتج بالظبط زي ما هو مكتوب في تقرير مبيعات فودكس، عشان المطابقة تنجح وقت المقارنة.", "Write the product name exactly as it appears in the Foodics sales report, so matching works when comparing.")}</div>
-        <div style={{ marginBottom: 14 }}>
-          <label style={smallLabel}>{t("اسم المنتج المباع (زي فودكس بالظبط)", "Sold product name (exactly as in Foodics)")}</label>
-          <input value={productName} onChange={(e) => setProductName(e.target.value)} style={{ ...inputStyle2, maxWidth: 400 }} placeholder={t("مثال: كوب قهوة بارد", "e.g. Cold Coffee Cup")} />
+        <div style={{ fontSize: 12.5, color: C.muted, marginBottom: 14 }}>{t("اكتب اسم المنتج بالظبط زي ما هو مكتوب في تقرير مبيعات فودكس، عشان المطابقة تنجح وقت المقارنة. نفس اسم المنتج ممكن يكون له ريسبي مختلف تمامًا في كل كيان.", "Write the product name exactly as it appears in the Foodics sales report. The same product name can have a completely different recipe in each entity.")}</div>
+        <div style={{ marginBottom: 14, display: "flex", gap: 12, flexWrap: "wrap" }}>
+          <div style={{ flex: "1 1 300px" }}>
+            <label style={smallLabel}>{t("اسم المنتج المباع (زي فودكس بالظبط)", "Sold product name (exactly as in Foodics)")}</label>
+            <input value={productName} onChange={(e) => setProductName(e.target.value)} style={inputStyle2} placeholder={t("مثال: كوب قهوة بارد", "e.g. Cold Coffee Cup")} />
+          </div>
+          {entities.length > 0 && (
+            <div>
+              <label style={smallLabel}>🏢 {t("الكيان (كل كيان له ريسبي مستقل)", "Entity (each entity has its own recipe)")}</label>
+              <select value={entity} onChange={(e) => setEntity(e.target.value)} style={{ ...inputStyle2, maxWidth: 200 }}>
+                {entities.map((e) => <option key={e} value={e}>{e}</option>)}
+              </select>
+            </div>
+          )}
         </div>
         <div style={{ fontWeight: 700, fontSize: 13.5, color: C.navy, marginBottom: 10 }}>🧾 {t("مكوّنات المنتج (من أصناف المستودع)", "Product ingredients (from warehouse items)")}</div>
         <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-end" }}>
@@ -1246,13 +1517,21 @@ function RecipesTab({ lang, t }) {
       <div style={cardStyle}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14, flexWrap: "wrap", gap: 10 }}>
           <div style={{ ...cardTitle, marginBottom: 0, border: "none", padding: 0 }}>📋 {t("كل الريسبيهات", "All recipes")} ({(recipes || []).length})</div>
-          <input value={search} onChange={(e) => setSearch(e.target.value)} style={{ ...inputStyle2, maxWidth: 220 }} placeholder={t("بحث...", "Search...")} />
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+            {entities.length > 0 && (
+              <select value={entityFilter} onChange={(e) => setEntityFilter(e.target.value)} style={{ ...inputStyle2, maxWidth: 180 }}>
+                <option value="all">{t("كل الكيانات", "All entities")}</option>
+                {entities.map((e) => <option key={e} value={e}>{e}</option>)}
+              </select>
+            )}
+            <input value={search} onChange={(e) => setSearch(e.target.value)} style={{ ...inputStyle2, maxWidth: 220 }} placeholder={t("بحث...", "Search...")} />
+          </div>
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
           {filtered.map((r) => (
             <div key={r.id} style={{ border: "1px solid " + C.border, borderRadius: 10, padding: 12 }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                <div style={{ fontWeight: 800, color: C.navy }}>{r.productName}</div>
+                <div style={{ fontWeight: 800, color: C.navy }}>{r.productName} {r.institution && <span style={{ fontSize: 11.5, fontWeight: 700, color: C.blue, background: C.blueSoft, borderRadius: 12, padding: "2px 8px", marginRight: 6 }}>🏢 {r.institution}</span>}</div>
                 <div>
                   <span onClick={() => editRecipe(r)} style={{ cursor: "pointer", color: C.blue, fontWeight: 700, fontSize: 13, marginLeft: 10 }}>{t("تعديل", "Edit")}</span>
                   <span onClick={() => removeRecipe(r)} style={{ cursor: "pointer", color: C.danger, fontWeight: 700, fontSize: 13 }}>{t("حذف", "Delete")}</span>
@@ -1296,6 +1575,9 @@ function ConsumptionVarianceTab({ meta, lang, t, institutionName }) {
   }, []);
   useEffect(() => { if (!branch && meta.branches?.length) setBranch(meta.branches[0]); }, [meta.branches]);
 
+  // نلاقي الكيان الأب للفرع المختار تلقائيًا من شجرة الفروع — عشان نستخدم ريسبي نفس الكيان بالظبط
+  const branchEntity = findEntityForBranch(branch, meta.branchTree);
+
   async function uploadSalesFile(file) {
     setUploading(true); setMsg("");
     try {
@@ -1307,19 +1589,21 @@ function ConsumptionVarianceTab({ meta, lang, t, institutionName }) {
       // نتوقّع عمودين على الأقل: اسم المنتج، والكمية المباعة (أي أعمدة زيادة بيتم تجاهلها)
       const parsed = dataRows.map((r) => ({ productName: String(r[0] || "").trim(), qty: Number(r[1]) || 0 })).filter((r) => r.productName && r.qty > 0);
       setSalesRows(parsed);
-      const recipeNames = new Set(recipes.map((r) => r.productName));
-      setUnmatchedProducts([...new Set(parsed.filter((r) => !recipeNames.has(r.productName)).map((r) => r.productName))]);
+      // نبحث عن ريسبي مطابق لنفس اسم المنتج ونفس كيان الفرع تحديدًا (أو ريسبي عام من غير كيان كحل احتياطي)
+      const matchableNames = new Set(recipes.filter((r) => (r.institution || "") === branchEntity || !r.institution).map((r) => r.productName));
+      setUnmatchedProducts([...new Set(parsed.filter((r) => !matchableNames.has(r.productName)).map((r) => r.productName))]);
       setMsg("✅ " + t(`تم رفع ${parsed.length} منتج من ملف المبيعات`, `${parsed.length} product(s) uploaded from the sales file`));
     } catch (e) { setMsg("Error: " + e.message); }
     setUploading(false);
   }
 
-  // الاستهلاك النظري: لكل منتج مباع في الملف، نضرب الكمية المباعة × مكوّنات الريسبي بتاعه
+  // الاستهلاك النظري: لكل منتج مباع في الملف، نضرب الكمية المباعة × مكوّنات ريسبي نفس كيان الفرع (أو ريسبي عام لو مفيش ريسبي خاص بالكيان)
   const theoretical = useMemo(() => {
     if (!salesRows) return {};
     const map = {}; // { itemName: totalQty }
     salesRows.forEach((sr) => {
-      const recipe = recipes.find((r) => r.productName === sr.productName);
+      const recipe = recipes.find((r) => r.productName === sr.productName && (r.institution || "") === branchEntity)
+        || recipes.find((r) => r.productName === sr.productName && !r.institution); // ريسبي عام كحل احتياطي لو مفيش نسخة خاصة بالكيان
       if (!recipe) return;
       recipe.ingredients.forEach((ing) => {
         const key = ing.itemId;
@@ -1329,7 +1613,7 @@ function ConsumptionVarianceTab({ meta, lang, t, institutionName }) {
     });
     return map;
     // eslint-disable-next-line
-  }, [salesRows, recipes]);
+  }, [salesRows, recipes, branchEntity]);
 
   // الاستهلاك الفعلي: من حركات الصرف الحقيقية لنفس الفرع ونفس الفترة
   const actual = useMemo(() => {
@@ -1377,6 +1661,7 @@ function ConsumptionVarianceTab({ meta, lang, t, institutionName }) {
             <button onClick={() => fileInputRef.current?.click()} disabled={uploading} style={smallBtn}>{uploading ? t("جارِ الرفع...", "Uploading...") : "⬆️ " + t("رفع ملف مبيعات فودكس", "Upload Foodics sales file")}</button>
           </div>
         </div>
+        {branchEntity && <div style={{ marginTop: 10, fontSize: 12.5, fontWeight: 700, color: C.blue }}>🏢 {t(`الفرع ده تابع لكيان "${branchEntity}" — هيتم استخدام ريسبي "${branchEntity}" تلقائيًا في الحساب`, `This branch belongs to entity "${branchEntity}" — "${branchEntity}"'s recipes will be used automatically`)}</div>}
         {msg && <div style={{ marginTop: 10, fontSize: 13, color: msg.startsWith("✅") ? C.success : C.danger }}>{msg}</div>}
         {unmatchedProducts.length > 0 && (
           <div style={{ marginTop: 10, background: "#fff7ed", border: "1px solid #fed7aa", borderRadius: 8, padding: "8px 12px", fontSize: 12 }}>
@@ -2819,6 +3104,7 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin, canConfirmRec
   const [approveQtys, setApproveQtys] = useState({}); // { requestId_lineIdx: qty } — مرحلة موافقة المدير
   const [receiveQtys, setReceiveQtys] = useState({}); // { requestId_lineIdx: qty } — مرحلة تأكيد الاستلام
   const [freshApproval, setFreshApproval] = useState(null); // طلب اتأكد استلامه حالًا، عشان نعرض ورقة طباعة فورية
+  const [freshManagerApproval, setFreshManagerApproval] = useState(null); // طلب وافق عليه المدير حالًا، عشان نعرض تأكيد واضح فورًا
 
   useEffect(() => {
     const unsub = ITEMS_COL.orderBy("nameAr").onSnapshot((snap) => setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
@@ -2873,6 +3159,7 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin, canConfirmRec
         managerApprovedBy: currentUser.name, managerApprovedAt: firebase.firestore.FieldValue.serverTimestamp(),
       });
       setMsg("✅ " + t("تمت الموافقة — الطلب دلوقتي بانتظار تأكيد الفرع المستلم", "Approved — the request now awaits the receiving branch's confirmation"));
+      setFreshManagerApproval({ ...req, lines: finalLines, managerApprovedByName: currentUser.name, managerApprovedAtDate: todayStr() });
     } catch (e) { setMsg("Error: " + e.message); }
     setSaving(false);
   }
@@ -3053,12 +3340,47 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin, canConfirmRec
         </div>
       </div>
 
+      {freshManagerApproval && <ManagerApprovalConfirm req={freshManagerApproval} lang={lang} t={t} onClose={() => setFreshManagerApproval(null)} />}
       {freshApproval && <BranchRequestVoucher req={freshApproval} lang={lang} t={t} onClose={() => setFreshApproval(null)} />}
     </div>
   );
 }
 
 /* ============ ورقة طباعة رسمية لتنفيذ طلب فرع: مين طلب، مين وافق، الفرع، التاريخ، والأصناف بالكميات المنفَّذة ============ */
+/* ============ تأكيد واضح فوري بعد موافقة مدير المستودع (المرحلة الأولى) — مع خيار طباعة قبل ما ينتقل الطلب لمرحلة الاستلام ============ */
+function ManagerApprovalConfirm({ req, lang, t, onClose }) {
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(8,15,35,0.6)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }} className="no-print">
+      <div style={{ background: "#fff", borderRadius: 16, padding: 30, maxWidth: 420, width: "100%" }}>
+        <div className="print-area" style={{ textAlign: "center" }}>
+          <div style={{ fontSize: 46, marginBottom: 6 }}>✅</div>
+          <div style={{ fontWeight: 800, fontSize: 18, color: C.success, marginBottom: 6 }}>{t("تمت الموافقة على الطلب", "Request Approved")}</div>
+          <div style={{ fontSize: 13, color: C.muted, marginBottom: 18 }}>{t("الطلب دلوقتي بانتظار تأكيد الفرع المستلم — الرصيد هيتحرّك بعد ما يأكّد الفرع الاستلام.", "The request now awaits the receiving branch's confirmation — stock will move once the branch confirms receipt.")}</div>
+          <table style={{ marginBottom: 6 }}>
+            <tbody>
+              <tr><td style={{ ...td, fontWeight: 700, width: 140 }}>{t("الفرع", "Branch")}</td><td style={td}>{req.branch}</td></tr>
+              <tr><td style={{ ...td, fontWeight: 700 }}>{t("تاريخ الموافقة", "Approval date")}</td><td style={td}>{req.managerApprovedAtDate}</td></tr>
+              <tr><td style={{ ...td, fontWeight: 700 }}>👤 {t("وافق عليه", "Approved by")}</td><td style={{ ...td, fontWeight: 700 }}>{req.managerApprovedByName}</td></tr>
+            </tbody>
+          </table>
+          <table>
+            <thead><tr><th style={th}>{t("الصنف", "Item")}</th><th style={th}>{t("الكمية الموافَق عليها", "Approved qty")}</th></tr></thead>
+            <tbody>
+              {req.lines.map((l, i) => (
+                <tr key={i}><td style={td}>{lang === "ar" ? l.itemName : (l.itemNameEn || l.itemName)}</td><td style={{ ...td, fontWeight: 700 }}>{fmt(l.qtyApproved)} {l.unit}</td></tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <div style={{ display: "flex", gap: 10, justifyContent: "center", marginTop: 20 }} className="no-print">
+          <button onClick={() => window.print()} style={smallBtn}>🖨️ {t("طباعة", "Print")}</button>
+          <button onClick={onClose} style={ghostBtn}>{t("إغلاق", "Close")}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function BranchRequestVoucher({ req, lang, t, onClose }) {
   return (
     <div>
@@ -3902,6 +4224,7 @@ const TAB_DEFS_WH = [
   { id: "quickscan", labelAr: "⚡ مسح سريع", labelEn: "⚡ Quick Scan", group: "stock" },
   { id: "items", labelAr: "الأصناف", labelEn: "Items", group: "stock" },
   { id: "labels", labelAr: "طباعة ملصقات", labelEn: "Print Labels", group: "stock" },
+  { id: "damage", labelAr: "🗑️ تالف/هدر", labelEn: "🗑️ Damage/Waste", group: "stock" },
 
   { id: "mainCount", labelAr: "جرد المستودع الرئيسي", labelEn: "Main Warehouse Count", group: "count" },
   { id: "count", labelAr: "جرد الفروع", labelEn: "Branch Count", group: "count" },
@@ -3909,6 +4232,7 @@ const TAB_DEFS_WH = [
 
   { id: "equipment", labelAr: "المعدات والصيانة", labelEn: "Equipment & Maintenance", group: "maintenance" },
   { id: "maintenanceRequest", labelAr: "طلب صيانة", labelEn: "Maintenance Request", group: "maintenance" },
+  { id: "production", labelAr: "🍳 الإنتاجية اليومية", labelEn: "🍳 Daily Production", group: null },
 
   { id: "purchase", labelAr: "قائمة شراء مقترحة", labelEn: "Suggested Purchase", group: "purchasing" },
   { id: "externalPurchase", labelAr: "طلب شراء خارجي", labelEn: "External Purchase", group: "purchasing" },
@@ -4236,13 +4560,16 @@ function App() {
   if (!currentUser) return <LoginScreen users={users} onLogin={handleLogin} />;
 
   const maintenanceOnly = isMaintenanceOnly(currentUser, whMeta);
+  const kitchenOnly = isKitchenOnly(currentUser, whMeta);
   const visibleTabs = maintenanceOnly
     ? TAB_DEFS_WH.filter((tb) => tb.id === "maintenanceRequest") // مسؤول الصيانة يشوف تبويب واحد بس، مفيش أي حاجة تانية
+    : kitchenOnly
+    ? TAB_DEFS_WH.filter((tb) => tb.id === "production") // موظف المطبخ يشوف تبويب واحد بس، مفيش أي حاجة تانية
     : TAB_DEFS_WH.filter((tb) => {
         if (["items", "in", "settings", "notifs", "labels", "purchase", "expiry", "suppliers", "dashboard", "equipment", "mainCount", "branchStatement", "recipes", "variance", "countSessions"].includes(tb.id)) return canManageWarehouse(currentUser, whMeta);
         return true; // out, count, reports, quickscan, branchRequest متاحة لمدير المستودع وموظفه
       });
-  const effectiveTab = visibleTabs.some((tb) => tb.id === tab) ? tab : (visibleTabs[0]?.id || (maintenanceOnly ? "maintenanceRequest" : "out"));
+  const effectiveTab = visibleTabs.some((tb) => tb.id === tab) ? tab : (visibleTabs[0]?.id || (maintenanceOnly ? "maintenanceRequest" : kitchenOnly ? "production" : "out"));
   const ungroupedTabs = visibleTabs.filter((tb) => !tb.group);
   const visibleGroups = TAB_GROUPS.map((g) => ({ ...g, children: visibleTabs.filter((tb) => tb.group === g.id) })).filter((g) => g.children.length > 0);
 
@@ -4305,7 +4632,9 @@ function App() {
         {effectiveTab === "expiry" && canManageWarehouse(currentUser, whMeta) && <ExpiryTab lang={lang} t={t} />}
         {effectiveTab === "equipment" && canManageWarehouse(currentUser, whMeta) && <EquipmentTab currentUser={currentUser} meta={meta} lang={lang} t={t} />}
         {effectiveTab === "maintenanceRequest" && <MaintenanceRequestTab currentUser={currentUser} lang={lang} t={t} isResponsible={isMaintenanceResponsible(currentUser, whMeta)} />}
-        {effectiveTab === "recipes" && canManageWarehouse(currentUser, whMeta) && <RecipesTab lang={lang} t={t} />}
+        {effectiveTab === "production" && <ProductionTab currentUser={currentUser} meta={meta} lang={lang} t={t} whMeta={whMeta} />}
+        {effectiveTab === "damage" && <DamageWasteTab currentUser={currentUser} meta={meta} lang={lang} t={t} isWhAdmin={canManageWarehouse(currentUser, whMeta)} />}
+        {effectiveTab === "recipes" && canManageWarehouse(currentUser, whMeta) && <RecipesTab lang={lang} t={t} meta={meta} />}
         {effectiveTab === "variance" && canManageWarehouse(currentUser, whMeta) && <ConsumptionVarianceTab meta={meta} lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
         {effectiveTab === "externalPurchase" && <ExternalPurchaseRequestTab currentUser={currentUser} meta={meta} lang={lang} t={t} isWhAdmin={canRequestForBranch(currentUser, whMeta)} />}
         {effectiveTab === "suppliers" && canManageWarehouse(currentUser, whMeta) && <SupplierStatementTab lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
