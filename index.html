@@ -3895,29 +3895,78 @@ function ReportsTab({ lang, t, institutionName }) {
   );
 }
 const TAB_DEFS_WH = [
-  { id: "dashboard", labelAr: "🏠 لوحة التحكم", labelEn: "🏠 Dashboard" },
-  { id: "in", labelAr: "وارد للمستودع", labelEn: "Stock In" },
-  { id: "out", labelAr: "صرف للفروع", labelEn: "Issue to Branch" },
-  { id: "branchRequest", labelAr: "طلب من المستودع", labelEn: "Request from Warehouse" },
-  { id: "quickscan", labelAr: "⚡ مسح سريع", labelEn: "⚡ Quick Scan" },
-  { id: "mainCount", labelAr: "🏢🧮 جرد المستودع الرئيسي", labelEn: "🏢🧮 Main Warehouse Count" },
-  { id: "countSessions", labelAr: "📑 كشوفات الجرد", labelEn: "📑 Count Statements" },
-  { id: "count", labelAr: "جرد الفروع", labelEn: "Branch Count" },
-  { id: "items", labelAr: "الأصناف", labelEn: "Items" },
-  { id: "labels", labelAr: "طباعة ملصقات", labelEn: "Print Labels" },
-  { id: "purchase", labelAr: "قائمة شراء مقترحة", labelEn: "Suggested Purchase" },
-  { id: "expiry", labelAr: "الصلاحية", labelEn: "Expiry" },
-  { id: "equipment", labelAr: "🔧 المعدات والصيانة", labelEn: "🔧 Equipment & Maintenance" },
-  { id: "maintenanceRequest", labelAr: "🔧📋 طلب صيانة", labelEn: "🔧📋 Maintenance Request" },
-  { id: "recipes", labelAr: "🧾 الريسبي", labelEn: "🧾 Recipes" },
-  { id: "variance", labelAr: "📊 مقارنة الاستهلاك", labelEn: "📊 Consumption Variance" },
-  { id: "externalPurchase", labelAr: "🛒 طلب شراء خارجي", labelEn: "🛒 External Purchase" },
-  { id: "suppliers", labelAr: "كشف حساب مورد", labelEn: "Supplier Statement" },
-  { id: "branchStatement", labelAr: "📋 كشف حساب فرع", labelEn: "📋 Branch Statement" },
-  { id: "reports", labelAr: "التقارير", labelEn: "Reports" },
-  { id: "notifs", labelAr: "الإشعارات", labelEn: "Notifications" },
-  { id: "settings", labelAr: "الإعدادات", labelEn: "Settings" },
+  { id: "dashboard", labelAr: "🏠 لوحة التحكم", labelEn: "🏠 Dashboard", group: null },
+
+  { id: "in", labelAr: "وارد للمستودع", labelEn: "Stock In", group: "stock" },
+  { id: "out", labelAr: "صرف للفروع", labelEn: "Issue to Branch", group: "stock" },
+  { id: "branchRequest", labelAr: "طلب من المستودع", labelEn: "Request from Warehouse", group: "stock" },
+  { id: "quickscan", labelAr: "⚡ مسح سريع", labelEn: "⚡ Quick Scan", group: "stock" },
+  { id: "items", labelAr: "الأصناف", labelEn: "Items", group: "stock" },
+  { id: "labels", labelAr: "طباعة ملصقات", labelEn: "Print Labels", group: "stock" },
+
+  { id: "mainCount", labelAr: "جرد المستودع الرئيسي", labelEn: "Main Warehouse Count", group: "count" },
+  { id: "count", labelAr: "جرد الفروع", labelEn: "Branch Count", group: "count" },
+  { id: "countSessions", labelAr: "كشوفات الجرد", labelEn: "Count Statements", group: "count" },
+
+  { id: "equipment", labelAr: "المعدات والصيانة", labelEn: "Equipment & Maintenance", group: "maintenance" },
+  { id: "maintenanceRequest", labelAr: "طلب صيانة", labelEn: "Maintenance Request", group: "maintenance" },
+
+  { id: "purchase", labelAr: "قائمة شراء مقترحة", labelEn: "Suggested Purchase", group: "purchasing" },
+  { id: "externalPurchase", labelAr: "طلب شراء خارجي", labelEn: "External Purchase", group: "purchasing" },
+  { id: "expiry", labelAr: "الصلاحية", labelEn: "Expiry", group: "purchasing" },
+
+  { id: "reports", labelAr: "التقارير", labelEn: "Reports", group: "reports" },
+  { id: "variance", labelAr: "مقارنة الاستهلاك", labelEn: "Consumption Variance", group: "reports" },
+  { id: "recipes", labelAr: "الريسبي", labelEn: "Recipes", group: "reports" },
+  { id: "suppliers", labelAr: "كشف حساب مورد", labelEn: "Supplier Statement", group: "reports" },
+  { id: "branchStatement", labelAr: "كشف حساب فرع", labelEn: "Branch Statement", group: "reports" },
+
+  { id: "notifs", labelAr: "🔔 الإشعارات", labelEn: "🔔 Notifications", group: null },
+  { id: "settings", labelAr: "⚙️ الإعدادات", labelEn: "⚙️ Settings", group: null },
 ];
+
+/* تعريف المجموعات: كل مجموعة ليها اسم وأيقونة، وترتيبها هو ترتيب ظهورها في القائمة */
+const TAB_GROUPS = [
+  { id: "stock", labelAr: "📦 المخزون", labelEn: "📦 Stock" },
+  { id: "count", labelAr: "🧮 الجرد", labelEn: "🧮 Inventory Count" },
+  { id: "maintenance", labelAr: "🔧 الصيانة", labelEn: "🔧 Maintenance" },
+  { id: "purchasing", labelAr: "🛒 المشتريات", labelEn: "🛒 Purchasing" },
+  { id: "reports", labelAr: "📊 التقارير والتحليل", labelEn: "📊 Reports & Analysis" },
+];
+
+/* ============ زرار مجموعة تبويبات بقائمة منسدلة — بتفتح مكانها بيتبع اتجاه اللغة تلقائيًا (insetInlineStart مش left/right ثابتين) ============ */
+function NavGroupDropdown({ group, lang, effectiveTab, setTab, openGroupId, setOpenGroupId }) {
+  const isOpen = openGroupId === group.id;
+  const hasActiveChild = group.children.some((c) => c.id === effectiveTab);
+  return (
+    <div style={{ position: "relative" }}>
+      <button onClick={() => setOpenGroupId(isOpen ? null : group.id)} style={{
+        padding: "8px 14px", borderRadius: 8, border: "none", cursor: "pointer", fontSize: 13, fontWeight: 700,
+        background: hasActiveChild || isOpen ? "#fff" : "rgba(255,255,255,0.12)", color: hasActiveChild || isOpen ? C.navy : "#fff",
+        display: "flex", alignItems: "center", gap: 6,
+      }}>
+        {lang === "ar" ? group.labelAr : group.labelEn}
+        <span style={{ fontSize: 10 }}>{isOpen ? "▲" : "▼"}</span>
+      </button>
+      {isOpen && (
+        <>
+          <div onClick={() => setOpenGroupId(null)} style={{ position: "fixed", inset: 0, zIndex: 40 }} />
+          <div style={{
+            position: "absolute", top: "calc(100% + 6px)", insetInlineStart: 0, zIndex: 50,
+            background: "#fff", borderRadius: 10, boxShadow: "0 14px 32px rgba(15,37,87,0.22)", minWidth: 200, overflow: "hidden",
+          }}>
+            {group.children.map((tb) => (
+              <div key={tb.id} onClick={() => { setTab(tb.id); setOpenGroupId(null); }} style={{
+                padding: "10px 16px", cursor: "pointer", fontSize: 13, fontWeight: effectiveTab === tb.id ? 700 : 500,
+                color: effectiveTab === tb.id ? C.blue : C.text, background: effectiveTab === tb.id ? C.blueSoft : "#fff",
+              }}>{lang === "ar" ? tb.labelAr : tb.labelEn}</div>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
 
 /* ============ لوحة التحكم الرئيسية: نظرة سريعة عند الدخول — أرصدة، تنبيهات، تحليل ذكي، طلبات معلّقة ============ */
 function WarehouseDashboard({ lang, t, setTab, meta, currentUser, whMeta }) {
@@ -4138,6 +4187,7 @@ function App() {
   const [whMeta, setWhMeta] = useState(null);
   const [currentUser, setCurrentUser] = useState(null);
   const [tab, setTab] = useState("dashboard");
+  const [openGroupId, setOpenGroupId] = useState(null);
   const [lang, setLang] = useState(localStorage.getItem("wh-lang") || "ar");
 
   function t(ar, en) { return lang === "ar" ? ar : en; }
@@ -4194,6 +4244,8 @@ function App() {
         return true; // out, count, reports, quickscan, branchRequest متاحة لمدير المستودع وموظفه
       });
   const effectiveTab = visibleTabs.some((tb) => tb.id === tab) ? tab : (visibleTabs[0]?.id || (maintenanceOnly ? "maintenanceRequest" : "out"));
+  const ungroupedTabs = visibleTabs.filter((tb) => !tb.group);
+  const visibleGroups = TAB_GROUPS.map((g) => ({ ...g, children: visibleTabs.filter((tb) => tb.group === g.id) })).filter((g) => g.children.length > 0);
 
   return (
     <div style={{ minHeight: "100vh" }}>
@@ -4203,7 +4255,16 @@ function App() {
       }} className="no-print">
         <div style={{ fontWeight: 800, fontSize: 15 }}>📦 {t("نظام إدارة المستودع", "Warehouse Management")}</div>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          {visibleTabs.map((tb) => (
+          {ungroupedTabs.filter((tb) => tb.id === "dashboard").map((tb) => (
+            <button key={tb.id} onClick={() => setTab(tb.id)} style={{
+              padding: "8px 14px", borderRadius: 8, border: "none", cursor: "pointer", fontSize: 13, fontWeight: 700,
+              background: effectiveTab === tb.id ? "#fff" : "rgba(255,255,255,0.12)", color: effectiveTab === tb.id ? C.navy : "#fff",
+            }}>{lang === "ar" ? tb.labelAr : tb.labelEn}</button>
+          ))}
+          {visibleGroups.map((g) => (
+            <NavGroupDropdown key={g.id} group={g} lang={lang} effectiveTab={effectiveTab} setTab={setTab} openGroupId={openGroupId} setOpenGroupId={setOpenGroupId} />
+          ))}
+          {ungroupedTabs.filter((tb) => tb.id !== "dashboard").map((tb) => (
             <button key={tb.id} onClick={() => setTab(tb.id)} style={{
               padding: "8px 14px", borderRadius: 8, border: "none", cursor: "pointer", fontSize: 13, fontWeight: 700,
               background: effectiveTab === tb.id ? "#fff" : "rgba(255,255,255,0.12)", color: effectiveTab === tb.id ? C.navy : "#fff",
