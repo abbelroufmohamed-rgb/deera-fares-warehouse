@@ -3141,12 +3141,22 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin, canConfirmRec
 
   useEffect(() => {
     const unsub = REQUESTS_COL.orderBy("createdAt", "desc").limit(100).onSnapshot((snap) => {
-      const all = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      // نطبّع الطلبات القديمة اللي اترسلت قبل مرحلة "مدير الكيان": نحسب كيان الفرع تلقائيًا لو مش محفوظ،
+      // ولو حالتها القديمة "pending" (من غير مرحلة كيان)، نعتبرها وصلت لمرحلة مدير المستودع مباشرة
+      const all = snap.docs.map((d) => {
+        const r = { id: d.id, ...d.data() };
+        return {
+          ...r,
+          branchEntity: r.branchEntity || findEntityForBranch(r.branch, meta.branchTree),
+          status: r.status === "pending" ? "pending_warehouse" : r.status,
+        };
+      });
       setAllRequests(all);
       setMyRequests(all.filter((r) => r.requestedBy === currentUser.name));
     });
     return unsub;
-  }, [currentUser.name]);
+    // eslint-disable-next-line
+  }, [currentUser.name, meta.branchTree]);
 
   function addLine() {
     const q = Number(qty);
