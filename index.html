@@ -116,7 +116,8 @@ function canRequestForBranch(currentUser, whMeta) { const r = getWarehouseRole(c
 function isMaintenanceResponsible(currentUser, whMeta) { const r = getWarehouseRole(currentUser, whMeta); return r === "wh_admin" || r === "wh_maintenance"; }
 function isMaintenanceOnly(currentUser, whMeta) { return getWarehouseRole(currentUser, whMeta) === "wh_maintenance"; }
 function isKitchenOnly(currentUser, whMeta) { return getWarehouseRole(currentUser, whMeta) === "wh_kitchen"; }
-const WAREHOUSE_ROLE_LABELS = { wh_admin: "مدير مستودع", wh_staff: "موظف مستودع", wh_maintenance: "مسؤول صيانة", wh_kitchen: "موظف مطبخ/إنتاج" };
+function isEntityManagerOnly(currentUser, whMeta) { return getWarehouseRole(currentUser, whMeta) === "wh_entity_manager"; }
+const WAREHOUSE_ROLE_LABELS = { wh_admin: "مدير مستودع", wh_staff: "موظف مستودع", wh_maintenance: "مسؤول صيانة", wh_kitchen: "موظف مطبخ/إنتاج", wh_entity_manager: "مدير كيان" };
 /* لو الموظف مقيّد بكيان معيّن (whMeta.userEntity)، بيشوف بضاعة هذا الكيان بس — فاضي/غير موجود = يشوف كل الكيانات */
 function getUserEntityRestriction(currentUser, whMeta) {
   const map = (whMeta && whMeta.userEntity) || {};
@@ -774,6 +775,7 @@ function WarehouseSettingsTab({ meta, whMeta, users, t }) {
                       <option value="wh_staff">{t("موظف مستودع", "Warehouse staff")}</option>
                       <option value="wh_maintenance">{t("مسؤول صيانة فقط", "Maintenance responsible only")}</option>
                       <option value="wh_kitchen">{t("موظف مطبخ/إنتاج فقط", "Kitchen/production staff only")}</option>
+                      <option value="wh_entity_manager">{t("مدير كيان (مرتبط بكيان محدد تحت)", "Entity manager (tied to entity below)")}</option>
                     </select>
                   </td>
                   <td style={td}>
@@ -3088,8 +3090,8 @@ function QuickScanTab({ currentUser, meta, lang, t, institutionName }) {
 }
 
 /* ============ شاشة جرد الفروع: تحديد الكمية الفعلية لكل صنف بفرع معيّن، ومقارنتها بالمتوقع، وإرسال إشعار نقص ============ */
-/* ============ طلب الفرع من المستودع الرئيسي: الشيف/موظف الفرع يطلب أصناف، وأمين المستودع يوافق (كلي/جزئي) أو يرفض ============ */
-function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin, canConfirmReceipt }) {
+/* ============ طلب الفرع من المستودع الرئيسي: 3 مراحل — موظف الفرع يطلب ← مدير الكيان يوافق ← مدير المستودع يوافق ← الفرع يأكّد الاستلام ============ */
+function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin, canConfirmReceipt, entityManagerFor }) {
   const [items, setItems] = useState([]);
   const [branch, setBranch] = useState("");
   const [lines, setLines] = useState([]);
@@ -3100,11 +3102,14 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin, canConfirmRec
   const [msg, setMsg] = useState("");
   const [myRequests, setMyRequests] = useState([]);
   const [allRequests, setAllRequests] = useState([]);
-  const [filterStatus, setFilterStatus] = useState("pending");
-  const [approveQtys, setApproveQtys] = useState({}); // { requestId_lineIdx: qty } — مرحلة موافقة المدير
+  const [filterStatus, setFilterStatus] = useState("pending_entity");
+  const [entityApproveQtys, setEntityApproveQtys] = useState({}); // { requestId_lineIdx: qty } — مرحلة مدير الكيان
+  const [approveQtys, setApproveQtys] = useState({}); // { requestId_lineIdx: qty } — مرحلة مدير المستودع
   const [receiveQtys, setReceiveQtys] = useState({}); // { requestId_lineIdx: qty } — مرحلة تأكيد الاستلام
   const [freshApproval, setFreshApproval] = useState(null); // طلب اتأكد استلامه حالًا، عشان نعرض ورقة طباعة فورية
   const [freshManagerApproval, setFreshManagerApproval] = useState(null); // طلب وافق عليه المدير حالًا، عشان نعرض تأكيد واضح فورًا
+
+  const isEntityManager = !!entityManagerFor; // مدير الكيان بيوافق بس على طلبات فروع كيانه
 
   useEffect(() => {
     const unsub = ITEMS_COL.orderBy("nameAr").onSnapshot((snap) => setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
@@ -3134,24 +3139,47 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin, canConfirmRec
     if (lines.length === 0) { setMsg(t("ضيف صنف واحد على الأقل قبل إرسال الطلب", "Add at least one item before sending the request")); return; }
     setSaving(true); setMsg("");
     try {
+      const branchEntity = findEntityForBranch(branch, meta.branchTree);
       await REQUESTS_COL.add({
-        branch, lines: lines.map((l) => ({ itemId: l.itemId, itemName: l.itemName, itemNameEn: l.itemNameEn, unit: l.unit, qtyRequested: l.qtyRequested, qtyApproved: 0, qtyReceived: 0 })),
-        note: note.trim(), status: "pending", requestedBy: currentUser.name, institutionId: DEFAULT_INSTITUTION_ID,
+        branch, branchEntity, lines: lines.map((l) => ({ itemId: l.itemId, itemName: l.itemName, itemNameEn: l.itemNameEn, unit: l.unit, qtyRequested: l.qtyRequested, qtyEntityApproved: 0, qtyApproved: 0, qtyReceived: 0 })),
+        note: note.trim(), status: "pending_entity", requestedBy: currentUser.name, institutionId: DEFAULT_INSTITUTION_ID,
         createdAt: firebase.firestore.FieldValue.serverTimestamp(),
       });
       setLines([]); setNote("");
-      setMsg("✅ " + t("تم إرسال الطلب للمستودع الرئيسي للمراجعة", "Request sent to the main warehouse for review"));
+      setMsg("✅ " + t("تم إرسال الطلب — هيمر أولًا على مدير الكيان، وبعدين المستودع الرئيسي", "Request sent — it will first go to the entity manager, then the main warehouse"));
     } catch (e) { setMsg("Error: " + e.message); }
     setSaving(false);
   }
 
-  /* ============ المرحلة 1: مسؤول المستودع يوافق على الكميات (بدون أي تحريك فعلي للرصيد) ============ */
+  /* ============ المرحلة 1: مدير الكيان يوافق على طلبات فروع كيانه فقط (بدون أي تحريك فعلي للرصيد) ============ */
+  async function entityManagerApprove(req, fulfillAll) {
+    setSaving(true); setMsg("");
+    try {
+      const finalLines = req.lines.map((l, i) => {
+        const key = req.id + "_" + i;
+        const q = fulfillAll ? l.qtyRequested : (Number(entityApproveQtys[key]) || 0);
+        return { ...l, qtyEntityApproved: q };
+      });
+      await REQUESTS_COL.doc(req.id).update({
+        lines: finalLines, status: "pending_warehouse",
+        entityApprovedBy: currentUser.name, entityApprovedAt: firebase.firestore.FieldValue.serverTimestamp(),
+      });
+      setMsg("✅ " + t("تمت موافقة مدير الكيان — الطلب دلوقتي عند مدير المستودع", "Entity manager approved — the request is now with the warehouse manager"));
+    } catch (e) { setMsg("Error: " + e.message); }
+    setSaving(false);
+  }
+  async function entityManagerReject(req) {
+    if (!confirm(t("هل تريد رفض هذا الطلب؟", "Reject this request?"))) return;
+    await REQUESTS_COL.doc(req.id).update({ status: "rejected", entityApprovedBy: currentUser.name, entityApprovedAt: firebase.firestore.FieldValue.serverTimestamp() });
+  }
+
+  /* ============ المرحلة 2: مدير المستودع يوافق على الكميات النهائية (بدون أي تحريك فعلي للرصيد) ============ */
   async function managerApprove(req, fulfillAll) {
     setSaving(true); setMsg("");
     try {
       const finalLines = req.lines.map((l, i) => {
         const key = req.id + "_" + i;
-        const q = fulfillAll ? l.qtyRequested : (Number(approveQtys[key]) || 0);
+        const q = fulfillAll ? l.qtyEntityApproved : (Number(approveQtys[key]) || 0);
         return { ...l, qtyApproved: q };
       });
       await REQUESTS_COL.doc(req.id).update({
@@ -3164,7 +3192,7 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin, canConfirmRec
     setSaving(false);
   }
 
-  async function rejectRequest(req) {
+  async function warehouseReject(req) {
     if (!confirm(t("هل تريد رفض هذا الطلب؟", "Reject this request?"))) return;
     await REQUESTS_COL.doc(req.id).update({ status: "rejected", reviewedBy: currentUser.name, reviewedAt: firebase.firestore.FieldValue.serverTimestamp() });
   }
@@ -3212,15 +3240,20 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin, canConfirmRec
   }
 
   const STATUS_LABEL = {
-    pending: t("قيد مراجعة المستودع", "Pending warehouse review"),
+    pending_entity: t("قيد مراجعة مدير الكيان", "Pending entity manager review"),
+    pending_warehouse: t("قيد مراجعة المستودع", "Pending warehouse review"),
     awaiting_receipt: t("بانتظار تأكيد الاستلام من الفرع", "Awaiting branch receipt confirmation"),
     approved: t("تم الاستلام بالكامل", "Fully received"),
     partial: t("تم الاستلام جزئيًا", "Partially received"),
     rejected: t("مرفوض", "Rejected"),
   };
-  const STATUS_COLOR = { pending: C.warn, awaiting_receipt: "#7c3aed", approved: C.success, partial: "#a16207", rejected: C.danger };
+  const STATUS_COLOR = { pending_entity: "#0891b2", pending_warehouse: C.warn, awaiting_receipt: "#7c3aed", approved: C.success, partial: "#a16207", rejected: C.danger };
 
-  const displayedRequests = isWhAdmin ? allRequests.filter((r) => filterStatus === "all" || r.status === filterStatus) : myRequests;
+  const displayedRequests = isEntityManager
+    ? allRequests.filter((r) => r.branchEntity === entityManagerFor && (filterStatus === "all" || r.status === filterStatus))
+    : isWhAdmin
+    ? allRequests.filter((r) => filterStatus === "all" || r.status === filterStatus)
+    : myRequests;
 
   return (
     <div>
@@ -3272,10 +3305,10 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin, canConfirmRec
 
       <div style={cardStyle}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 14 }}>
-          <div style={{ ...cardTitle, marginBottom: 0, border: "none", padding: 0 }}>🕒 {isWhAdmin ? t("كل طلبات الفروع", "All branch requests") : t("طلباتي السابقة", "My previous requests")}</div>
-          {isWhAdmin && (
+          <div style={{ ...cardTitle, marginBottom: 0, border: "none", padding: 0 }}>🕒 {isEntityManager ? t(`طلبات فروع كيان "${entityManagerFor}"`, `"${entityManagerFor}" Entity Branch Requests`) : isWhAdmin ? t("كل طلبات الفروع", "All branch requests") : t("طلباتي السابقة", "My previous requests")}</div>
+          {(isWhAdmin || isEntityManager) && (
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-              {["pending", "awaiting_receipt", "approved", "partial", "rejected", "all"].map((s) => (
+              {["pending_entity", "pending_warehouse", "awaiting_receipt", "approved", "partial", "rejected", "all"].map((s) => (
                 <button key={s} onClick={() => setFilterStatus(s)} style={filterStatus === s ? smallBtn : ghostBtn}>{s === "all" ? t("الكل", "All") : STATUS_LABEL[s]}</button>
               ))}
             </div>
@@ -3287,16 +3320,19 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin, canConfirmRec
               <div style={{ display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 8, marginBottom: 8 }}>
                 <div>
                   <span style={{ fontWeight: 800, color: C.navy }}>{r.branch}</span>
-                  {isWhAdmin && <span style={{ fontSize: 12, color: C.muted }}> — {t("من:", "from:")} {r.requestedBy}</span>}
+                  {r.branchEntity && <span style={{ fontSize: 11, color: C.blue, fontWeight: 700 }}> 🏢 {r.branchEntity}</span>}
+                  {(isWhAdmin || isEntityManager) && <span style={{ fontSize: 12, color: C.muted }}> — {t("من:", "from:")} {r.requestedBy}</span>}
                 </div>
                 <span style={{ fontWeight: 700, color: STATUS_COLOR[r.status] }}>{STATUS_LABEL[r.status]}</span>
               </div>
               <table>
                 <thead><tr>
                   <th style={th}>{t("الصنف", "Item")}</th><th style={th}>{t("المطلوب", "Requested")}</th>
+                  {r.status !== "pending_entity" && <th style={th}>{t("وافق عليه مدير الكيان", "Entity manager approved")}</th>}
                   {(r.status === "awaiting_receipt" || r.status === "approved" || r.status === "partial") && <th style={th}>{t("وافق عليه المستودع", "Warehouse approved")}</th>}
                   {(r.status === "approved" || r.status === "partial") && <th style={th}>{t("المستلم فعليًا", "Actually received")}</th>}
-                  {isWhAdmin && r.status === "pending" && <th style={th}>{t("كمية الموافقة", "Approve qty")}</th>}
+                  {isEntityManager && r.status === "pending_entity" && <th style={th}>{t("كمية موافقة مدير الكيان", "Entity manager approve qty")}</th>}
+                  {isWhAdmin && r.status === "pending_warehouse" && <th style={th}>{t("كمية موافقة المستودع", "Warehouse approve qty")}</th>}
                   {canConfirmReceipt && r.status === "awaiting_receipt" && <th style={th}>{t("الكمية المستلمة فعليًا", "Actual received qty")}</th>}
                 </tr></thead>
                 <tbody>
@@ -3304,10 +3340,14 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin, canConfirmRec
                     <tr key={i}>
                       <td style={td}>{lang === "ar" ? l.itemName : (l.itemNameEn || l.itemName)}</td>
                       <td style={td}>{fmt(l.qtyRequested)} {l.unit}</td>
+                      {r.status !== "pending_entity" && <td style={td}>{fmt(l.qtyEntityApproved)}</td>}
                       {(r.status === "awaiting_receipt" || r.status === "approved" || r.status === "partial") && <td style={td}>{fmt(l.qtyApproved)}</td>}
                       {(r.status === "approved" || r.status === "partial") && <td style={{ ...td, color: l.qtyReceived >= l.qtyRequested ? C.success : C.warn, fontWeight: 700 }}>{fmt(l.qtyReceived)}</td>}
-                      {isWhAdmin && r.status === "pending" && (
-                        <td style={td}><input type="number" step="0.01" placeholder={String(l.qtyRequested)} onChange={(e) => setApproveQtys((a) => ({ ...a, [r.id + "_" + i]: e.target.value }))} style={{ ...inputStyle2, width: 100 }} /></td>
+                      {isEntityManager && r.status === "pending_entity" && (
+                        <td style={td}><input type="number" step="0.01" placeholder={String(l.qtyRequested)} onChange={(e) => setEntityApproveQtys((a) => ({ ...a, [r.id + "_" + i]: e.target.value }))} style={{ ...inputStyle2, width: 100 }} /></td>
+                      )}
+                      {isWhAdmin && r.status === "pending_warehouse" && (
+                        <td style={td}><input type="number" step="0.01" placeholder={String(l.qtyEntityApproved)} onChange={(e) => setApproveQtys((a) => ({ ...a, [r.id + "_" + i]: e.target.value }))} style={{ ...inputStyle2, width: 100 }} /></td>
                       )}
                       {canConfirmReceipt && r.status === "awaiting_receipt" && (
                         <td style={td}><input type="number" step="0.01" placeholder={String(l.qtyApproved)} onChange={(e) => setReceiveQtys((a) => ({ ...a, [r.id + "_" + i]: e.target.value }))} style={{ ...inputStyle2, width: 100 }} /></td>
@@ -3317,11 +3357,21 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin, canConfirmRec
                 </tbody>
               </table>
               {r.note && <div style={{ fontSize: 12, color: C.muted, marginTop: 6 }}>{t("ملاحظة:", "Note:")} {r.note}</div>}
-              {isWhAdmin && r.status === "pending" && (
+              {isEntityManager && r.status === "pending_entity" && (
                 <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
-                  <button onClick={() => managerApprove(r, true)} disabled={saving} style={smallBtn}>✅ {t("موافقة كاملة (الكميات المطلوبة كلها)", "Approve fully (all requested quantities)")}</button>
+                  <button onClick={() => entityManagerApprove(r, true)} disabled={saving} style={smallBtn}>✅ {t("موافقة كاملة (الكميات المطلوبة كلها)", "Approve fully (all requested quantities)")}</button>
+                  <button onClick={() => entityManagerApprove(r, false)} disabled={saving} style={ghostBtn}>{t("موافقة بالكميات المكتوبة فوق", "Approve with amounts entered above")}</button>
+                  <button onClick={() => entityManagerReject(r)} style={{ ...ghostBtn, color: C.danger, borderColor: C.danger }}>{t("رفض", "Reject")}</button>
+                </div>
+              )}
+              {r.status === "pending_entity" && !isEntityManager && (isWhAdmin) && (
+                <div style={{ fontSize: 12, color: C.muted, marginTop: 8 }}>{t("بانتظار موافقة مدير الكيان أولًا.", "Awaiting entity manager approval first.")}</div>
+              )}
+              {isWhAdmin && r.status === "pending_warehouse" && (
+                <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+                  <button onClick={() => managerApprove(r, true)} disabled={saving} style={smallBtn}>✅ {t("موافقة كاملة (الكميات المعتمدة من مدير الكيان)", "Approve fully (entity-approved quantities)")}</button>
                   <button onClick={() => managerApprove(r, false)} disabled={saving} style={ghostBtn}>{t("موافقة بالكميات المكتوبة فوق", "Approve with amounts entered above")}</button>
-                  <button onClick={() => rejectRequest(r)} style={{ ...ghostBtn, color: C.danger, borderColor: C.danger }}>{t("رفض", "Reject")}</button>
+                  <button onClick={() => warehouseReject(r)} style={{ ...ghostBtn, color: C.danger, borderColor: C.danger }}>{t("رفض", "Reject")}</button>
                 </div>
               )}
               {r.status === "awaiting_receipt" && (
@@ -4561,15 +4611,18 @@ function App() {
 
   const maintenanceOnly = isMaintenanceOnly(currentUser, whMeta);
   const kitchenOnly = isKitchenOnly(currentUser, whMeta);
+  const entityManagerOnly = isEntityManagerOnly(currentUser, whMeta);
   const visibleTabs = maintenanceOnly
     ? TAB_DEFS_WH.filter((tb) => tb.id === "maintenanceRequest") // مسؤول الصيانة يشوف تبويب واحد بس، مفيش أي حاجة تانية
     : kitchenOnly
     ? TAB_DEFS_WH.filter((tb) => tb.id === "production") // موظف المطبخ يشوف تبويب واحد بس، مفيش أي حاجة تانية
+    : entityManagerOnly
+    ? TAB_DEFS_WH.filter((tb) => tb.id === "branchRequest") // مدير الكيان يشوف تبويب واحد بس، مفيش أي حاجة تانية
     : TAB_DEFS_WH.filter((tb) => {
         if (["items", "in", "settings", "notifs", "labels", "purchase", "expiry", "suppliers", "dashboard", "equipment", "mainCount", "branchStatement", "recipes", "variance", "countSessions"].includes(tb.id)) return canManageWarehouse(currentUser, whMeta);
         return true; // out, count, reports, quickscan, branchRequest متاحة لمدير المستودع وموظفه
       });
-  const effectiveTab = visibleTabs.some((tb) => tb.id === tab) ? tab : (visibleTabs[0]?.id || (maintenanceOnly ? "maintenanceRequest" : kitchenOnly ? "production" : "out"));
+  const effectiveTab = visibleTabs.some((tb) => tb.id === tab) ? tab : (visibleTabs[0]?.id || (maintenanceOnly ? "maintenanceRequest" : kitchenOnly ? "production" : entityManagerOnly ? "branchRequest" : "out"));
   const ungroupedTabs = visibleTabs.filter((tb) => !tb.group);
   const visibleGroups = TAB_GROUPS.map((g) => ({ ...g, children: visibleTabs.filter((tb) => tb.group === g.id) })).filter((g) => g.children.length > 0);
 
@@ -4620,7 +4673,8 @@ function App() {
         {effectiveTab === "branchRequest" && (
           <BranchRequestTab currentUser={currentUser} meta={meta} lang={lang} t={t}
             isWhAdmin={canRequestForBranch(currentUser, whMeta) && !getUserEntityRestriction(currentUser, whMeta)}
-            canConfirmReceipt={canRequestForBranch(currentUser, whMeta)} />
+            canConfirmReceipt={canRequestForBranch(currentUser, whMeta)}
+            entityManagerFor={isEntityManagerOnly(currentUser, whMeta) ? getUserEntityRestriction(currentUser, whMeta) : ""} />
         )}
         {effectiveTab === "quickscan" && <QuickScanTab currentUser={currentUser} meta={meta} lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
         {effectiveTab === "mainCount" && canManageWarehouse(currentUser, whMeta) && <MainWarehouseCountTab currentUser={currentUser} meta={meta} lang={lang} t={t} />}
