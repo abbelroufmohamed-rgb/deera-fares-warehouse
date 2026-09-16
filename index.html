@@ -3835,20 +3835,34 @@ function MovesLogTab({ currentUser, meta, lang, t }) {
     try {
       const isRealBranch = m.branch && (meta.branches || []).includes(m.branch); // الحركة اتصرفت لفرع حقيقي (مش "تالف/هدر" أو "إنتاج مطبخ" وغيرها)
       const bsRef = isRealBranch ? BRANCH_STOCK_COL.doc(branchStockDocId(m.branch, m.itemId)) : null;
+      let itemWasRecreated = false;
       await db.runTransaction(async (tx) => {
         const itemRef = ITEMS_COL.doc(m.itemId);
         const itemSnap = await tx.get(itemRef); // كل القراءات لازم تحصل قبل أي كتابة
         const bsSnap = bsRef ? await tx.get(bsRef) : null;
-        const curQty = Number(itemSnap.data()?.qty) || 0;
         const delta = m.type === "out" ? Number(m.qty) : -Number(m.qty); // التراجع عن صرف بيرجّع الكمية، والتراجع عن وارد بيسحبها
-        tx.update(itemRef, { qty: curQty + delta });
+        if (itemSnap.exists) {
+          const curQty = Number(itemSnap.data().qty) || 0;
+          tx.update(itemRef, { qty: curQty + delta });
+        } else {
+          // الصنف كان محذوف خالص من شاشة الأصناف — نعيد إنشاءه تلقائيًا ببيانات أساسية من نفس الحركة (اسمه ووحدته)
+          // عشان التراجع يشتغل ورصيده يرجع صح، بدل ما تحتاج تسجّله يدوي من الأول
+          itemWasRecreated = true;
+          tx.set(itemRef, {
+            nameAr: m.itemName || "", nameEn: m.itemNameEn || "", unit: m.unit || "قطعة",
+            sku: uid().toUpperCase(), price: 0, minStock: 0, category: "", institution: "",
+            qty: delta, institutionId: DEFAULT_INSTITUTION_ID, createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+          });
+        }
         if (bsRef && bsSnap) {
           const curBranchQty = bsSnap.exists ? (Number(bsSnap.data().qty) || 0) : 0;
           tx.set(bsRef, { qty: Math.max(0, curBranchQty - Number(m.qty)) }, { merge: true });
         }
       });
       await MOVES_COL.doc(m.id).update({ reversed: true, reversedBy: currentUser.name, reversedAt: firebase.firestore.FieldValue.serverTimestamp() });
-      setMsg("✅ " + t("تم التراجع عن الحركة وإرجاع الرصيد بنجاح", "Movement reversed and stock restored successfully"));
+      setMsg("✅ " + (itemWasRecreated
+        ? t(`تم التراجع عن الحركة. تنبيه: الصنف "${m.itemName}" كان محذوف، فتم إعادة إنشائه تلقائيًا برصيده الصحيح — روح لشاشة "الأصناف" وكمّل بياناته (السعر، الفئة، الكيان).`, `Movement reversed. Note: "${m.itemName}" was deleted, so it was automatically recreated with the correct stock — go to "Items" and complete its details (price, category, entity).`)
+        : t("تم التراجع عن الحركة وإرجاع الرصيد بنجاح", "Movement reversed and stock restored successfully")));
     } catch (e) { setMsg("Error: " + e.message); }
     setBusyId(null);
   }
