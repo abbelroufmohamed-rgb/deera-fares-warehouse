@@ -123,6 +123,11 @@ function getUserEntityRestriction(currentUser, whMeta) {
   const map = (whMeta && whMeta.userEntity) || {};
   return map[currentUser.id] || "";
 }
+/* لو الموظف مقيّد بفرع معيّن (whMeta.userBranch)، بيشتغل على فرعه بس — مش أي فرع تاني حتى لو تابع لنفس كيانه */
+function getUserBranchRestriction(currentUser, whMeta) {
+  const map = (whMeta && whMeta.userBranch) || {};
+  return map[currentUser.id] || "";
+}
 
 /* ============ توليد QR لصنف (يشفّر كود الصنف فقط) — بيستخدم مكتبة qrcode-generator الموثوقة، بيرسم كصورة data URL ============ */
 /* ============ ضغط صورة داخل المتصفح قبل الحفظ (نفس أسلوب تطبيق الكاشير) — بيرجع data URL جاهز للتخزين في Firestore ============ */
@@ -752,6 +757,14 @@ function WarehouseSettingsTab({ meta, whMeta, users, t }) {
       await WH_META_DOC.set({ userEntity: { ...current, [userId]: entity } }, { merge: true });
     }
   }
+  async function setUserBranch(userId, branch) {
+    const current = whMeta.userBranch || {};
+    if (!branch) {
+      await WH_META_DOC.set({ userBranch: { [userId]: firebase.firestore.FieldValue.delete() } }, { merge: true });
+    } else {
+      await WH_META_DOC.set({ userBranch: { ...current, [userId]: branch } }, { merge: true });
+    }
+  }
 
   const entities = getAllEntityNames(meta.branchTree);
 
@@ -759,10 +772,10 @@ function WarehouseSettingsTab({ meta, whMeta, users, t }) {
     <div>
       <div style={cardStyle}>
         <div style={cardTitle}>👥 {t("أدوار المستودع (مستقلة عن أدوار الكاشير)", "Warehouse Roles (independent from cashier roles)")}</div>
-        <div style={{ fontSize: 12.5, color: C.muted, marginBottom: 14 }}>{t("حدّد لكل مستخدم دوره في نظام المستودع، وممكن كمان تقيّده يشوف بضاعة كيان واحد بس (مثلاً موظف يشوف \"ريشيو\" بس ومش يشوف \"24\" أو \"مسكوب\").", "Assign each user their role in the warehouse system, and optionally restrict them to seeing only one entity's stock (e.g. an employee sees only \"Ratio\", not \"24\" or \"Maskoub\").")}</div>
+        <div style={{ fontSize: 12.5, color: C.muted, marginBottom: 14 }}>{t("حدّد لكل مستخدم دوره في نظام المستودع، وممكن كمان تقيّده يشوف بضاعة كيان واحد بس، وفرع واحد بس لو محتاج تحديد أدق (مثلاً موظف يشتغل بس على فرع \"24 التآخي\" من غير باقي فروع كيان \"24\").", "Assign each user their role in the warehouse system, and optionally restrict them to one entity, and one specific branch for finer control (e.g. an employee working only on \"24 Al-Ta'akhi\", not other \"24\" branches).")}</div>
         <div style={{ overflowX: "auto" }}>
           <table>
-            <thead><tr><th style={th}>{t("المستخدم", "User")}</th><th style={th}>{t("دوره في الكاشير", "Cashier role")}</th><th style={th}>{t("دوره في المستودع", "Warehouse role")}</th><th style={th}>🏢 {t("مقيّد بكيان", "Restricted to entity")}</th></tr></thead>
+            <thead><tr><th style={th}>{t("المستخدم", "User")}</th><th style={th}>{t("دوره في الكاشير", "Cashier role")}</th><th style={th}>{t("دوره في المستودع", "Warehouse role")}</th><th style={th}>🏢 {t("مقيّد بكيان", "Restricted to entity")}</th><th style={th}>📍 {t("مقيّد بفرع محدد", "Restricted to specific branch")}</th></tr></thead>
             <tbody>
               {(users || []).map((u) => (
                 <tr key={u.id}>
@@ -784,9 +797,15 @@ function WarehouseSettingsTab({ meta, whMeta, users, t }) {
                       {entities.map((e) => <option key={e} value={e}>{e}</option>)}
                     </select>
                   </td>
+                  <td style={td}>
+                    <select value={(whMeta.userBranch || {})[u.id] || ""} onChange={(e) => setUserBranch(u.id, e.target.value)} style={{ ...inputStyle2, maxWidth: 180 }}>
+                      <option value="">{t("كل فروع الكيان", "All entity branches")}</option>
+                      <GroupedBranchOptions meta={meta} />
+                    </select>
+                  </td>
                 </tr>
               ))}
-              {(users || []).length === 0 && <tr><td colSpan={4} style={{ ...td, textAlign: "center", color: "#9ca3af" }}>{t("لا يوجد مستخدمين", "No users")}</td></tr>}
+              {(users || []).length === 0 && <tr><td colSpan={5} style={{ ...td, textAlign: "center", color: "#9ca3af" }}>{t("لا يوجد مستخدمين", "No users")}</td></tr>}
             </tbody>
           </table>
         </div>
@@ -3091,9 +3110,11 @@ function QuickScanTab({ currentUser, meta, lang, t, institutionName }) {
 
 /* ============ شاشة جرد الفروع: تحديد الكمية الفعلية لكل صنف بفرع معيّن، ومقارنتها بالمتوقع، وإرسال إشعار نقص ============ */
 /* ============ طلب الفرع من المستودع الرئيسي: 3 مراحل — موظف الفرع يطلب ← مدير الكيان يوافق ← مدير المستودع يوافق ← الفرع يأكّد الاستلام ============ */
-function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin, canConfirmReceipt, entityManagerFor }) {
+function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin, canConfirmReceipt, entityManagerFor, whMeta }) {
+  const restrictedBranch = getUserBranchRestriction(currentUser, whMeta);
+  const restrictedEntity = getUserEntityRestriction(currentUser, whMeta);
   const [items, setItems] = useState([]);
-  const [branch, setBranch] = useState("");
+  const [branch, setBranch] = useState(restrictedBranch || "");
   const [lines, setLines] = useState([]);
   const [selectedItem, setSelectedItem] = useState(null);
   const [qty, setQty] = useState("");
@@ -3110,12 +3131,13 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin, canConfirmRec
   const [freshManagerApproval, setFreshManagerApproval] = useState(null); // طلب وافق عليه المدير حالًا، عشان نعرض تأكيد واضح فورًا
 
   const isEntityManager = !!entityManagerFor; // مدير الكيان بيوافق بس على طلبات فروع كيانه
+  const pickableItems = restrictedEntity ? items.filter((it) => (it.institution || "") === restrictedEntity) : items;
 
   useEffect(() => {
     const unsub = ITEMS_COL.orderBy("nameAr").onSnapshot((snap) => setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
     return unsub;
   }, []);
-  useEffect(() => { if (!branch && meta.branches?.length) setBranch(meta.branches[0]); }, [meta.branches]);
+  useEffect(() => { if (!branch && !restrictedBranch && meta.branches?.length) setBranch(meta.branches[0]); }, [meta.branches]);
 
   useEffect(() => {
     const unsub = REQUESTS_COL.orderBy("createdAt", "desc").limit(100).onSnapshot((snap) => {
@@ -3261,13 +3283,14 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin, canConfirmRec
         <div style={cardTitle}>📋 {t("طلب أصناف من المستودع الرئيسي", "Request Items from Main Warehouse")}</div>
         <div style={{ marginBottom: 14 }}>
           <label style={smallLabel}>{t("الفرع الطالب", "Requesting branch")}</label>
-          <select value={branch} onChange={(e) => setBranch(e.target.value)} style={{ ...inputStyle2, maxWidth: 240 }}>
-            <GroupedBranchOptions meta={meta} />
+          <select value={branch} onChange={(e) => setBranch(e.target.value)} disabled={!!restrictedBranch} style={{ ...inputStyle2, maxWidth: 240 }}>
+            {restrictedBranch ? <option value={restrictedBranch}>{restrictedBranch}</option> : <GroupedBranchOptions meta={meta} />}
           </select>
+          {restrictedBranch && <div style={{ fontSize: 11.5, color: C.blue, marginTop: 4 }}>📍 {t("مقيّد بفرعك المخصص بس", "Restricted to your assigned branch only")}</div>}
         </div>
         <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
           <div style={{ flex: "1 1 260px" }}>
-            <ItemPicker items={items} lang={lang} t={t} onPick={setSelectedItem} selectedItem={selectedItem} />
+            <ItemPicker items={pickableItems} lang={lang} t={t} onPick={setSelectedItem} selectedItem={selectedItem} />
           </div>
           <div style={{ flex: "1 1 120px" }}>
             <label style={smallLabel}>{t("الكمية المطلوبة", "Requested qty")} {selectedItem && `(${selectedItem.unit})`}</label>
@@ -3620,8 +3643,10 @@ function MainWarehouseCountTab({ currentUser, meta, lang, t }) {
   );
 }
 
-function BranchCountTab({ currentUser, meta, lang, t }) {
-  const [branch, setBranch] = useState("");
+function BranchCountTab({ currentUser, meta, lang, t, whMeta }) {
+  const restrictedBranch = getUserBranchRestriction(currentUser, whMeta);
+  const restrictedEntity = getUserEntityRestriction(currentUser, whMeta);
+  const [branch, setBranch] = useState(restrictedBranch || "");
   const [branchStock, setBranchStock] = useState([]);
   const [extraItems, setExtraItems] = useState([]); // أصناف أضيفت يدويًا للجرد (مالهاش سجل مخزون سابق في الفرع)
   const [allItems, setAllItems] = useState([]);
@@ -3631,11 +3656,13 @@ function BranchCountTab({ currentUser, meta, lang, t }) {
   const [msg, setMsg] = useState("");
   const [history, setHistory] = useState([]);
 
-  useEffect(() => { if (!branch && meta.branches?.length) setBranch(meta.branches[0]); }, [meta.branches]);
+  useEffect(() => { if (!branch && !restrictedBranch && meta.branches?.length) setBranch(meta.branches[0]); }, [meta.branches]);
   useEffect(() => {
     const unsub = ITEMS_COL.orderBy("nameAr").onSnapshot((snap) => setAllItems(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
     return unsub;
   }, []);
+  // لو الموظف مقيّد بكيان، ميشوفش في اختيار "أضف صنف للجرد" غير أصناف كيانه بس
+  const pickableItems = restrictedEntity ? allItems.filter((it) => (it.institution || "") === restrictedEntity) : allItems;
   useEffect(() => {
     if (!branch) return;
     setExtraItems([]); // نصفّر الأصناف اليدوية لما نغيّر الفرع
@@ -3704,15 +3731,16 @@ function BranchCountTab({ currentUser, meta, lang, t }) {
         <div style={{ fontSize: 12.5, color: C.muted, marginBottom: 14 }}>{t("اختر الفرع، وسجّل الكمية الفعلية الموجودة عنده لكل صنف. أي نقص عن المتوقع بيتبعت كإشعار تلقائي.", "Choose the branch and record the actual counted quantity for each item. Any shortage below the expected amount triggers an automatic notification.")}</div>
         <div style={{ marginBottom: 14 }}>
           <label style={smallLabel}>{t("الفرع", "Branch")}</label>
-          <select value={branch} onChange={(e) => { setBranch(e.target.value); setCounted({}); }} style={{ ...inputStyle2, maxWidth: 260 }}>
-            <GroupedBranchOptions meta={meta} />
+          <select value={branch} onChange={(e) => { setBranch(e.target.value); setCounted({}); }} disabled={!!restrictedBranch} style={{ ...inputStyle2, maxWidth: 260 }}>
+            {restrictedBranch ? <option value={restrictedBranch}>{restrictedBranch}</option> : <GroupedBranchOptions meta={meta} />}
           </select>
+          {restrictedBranch && <div style={{ fontSize: 11.5, color: C.blue, marginTop: 4 }}>📍 {t("مقيّد بفرعك المخصص بس", "Restricted to your assigned branch only")}</div>}
         </div>
         <div style={{ background: C.blueSoft, borderRadius: 10, padding: 12, marginBottom: 14 }}>
           <div style={{ fontWeight: 700, fontSize: 12.5, color: C.navy, marginBottom: 8 }}>➕ {t("إضافة صنف للجرد (لو مش ظاهر في القائمة تحت)", "Add item to count (if not already listed below)")}</div>
           <div style={{ display: "flex", gap: 10, alignItems: "flex-end", flexWrap: "wrap" }}>
             <div style={{ flex: "1 1 240px" }}>
-              <ItemPicker items={allItems} lang={lang} t={t} onPick={setAddItemPick} selectedItem={addItemPick} />
+              <ItemPicker items={pickableItems} lang={lang} t={t} onPick={setAddItemPick} selectedItem={addItemPick} />
             </div>
             <button onClick={addItemToCount} style={ghostBtn}>➕ {t("أضف للجرد", "Add to count")}</button>
           </div>
@@ -4671,7 +4699,7 @@ function App() {
         {effectiveTab === "in" && canManageWarehouse(currentUser, whMeta) && <StockInTab currentUser={currentUser} lang={lang} t={t} />}
         {effectiveTab === "out" && <StockOutTab currentUser={currentUser} meta={meta} lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
         {effectiveTab === "branchRequest" && (
-          <BranchRequestTab currentUser={currentUser} meta={meta} lang={lang} t={t}
+          <BranchRequestTab currentUser={currentUser} meta={meta} lang={lang} t={t} whMeta={whMeta}
             isWhAdmin={canRequestForBranch(currentUser, whMeta) && !getUserEntityRestriction(currentUser, whMeta)}
             canConfirmReceipt={canRequestForBranch(currentUser, whMeta)}
             entityManagerFor={isEntityManagerOnly(currentUser, whMeta) ? getUserEntityRestriction(currentUser, whMeta) : ""} />
@@ -4679,7 +4707,7 @@ function App() {
         {effectiveTab === "quickscan" && <QuickScanTab currentUser={currentUser} meta={meta} lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
         {effectiveTab === "mainCount" && canManageWarehouse(currentUser, whMeta) && <MainWarehouseCountTab currentUser={currentUser} meta={meta} lang={lang} t={t} />}
         {effectiveTab === "countSessions" && canManageWarehouse(currentUser, whMeta) && <CountSessionsTab lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
-        {effectiveTab === "count" && <BranchCountTab currentUser={currentUser} meta={meta} lang={lang} t={t} />}
+        {effectiveTab === "count" && <BranchCountTab currentUser={currentUser} meta={meta} lang={lang} t={t} whMeta={whMeta} />}
         {effectiveTab === "items" && canManageWarehouse(currentUser, whMeta) && <ItemsTab currentUser={currentUser} lang={lang} t={t} whMeta={whMeta} meta={meta} />}
         {effectiveTab === "labels" && canManageWarehouse(currentUser, whMeta) && <BulkLabelsTab lang={lang} t={t} />}
         {effectiveTab === "purchase" && canManageWarehouse(currentUser, whMeta) && <SuggestedPurchaseTab lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
