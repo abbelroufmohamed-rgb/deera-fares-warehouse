@@ -3808,6 +3808,102 @@ function BranchCountTab({ currentUser, meta, lang, t, whMeta }) {
 /* ============ شاشة الإشعارات (نقص الأصناف عند الفروع) ============ */
 /* ============ شاشة تتبّع تواريخ الصلاحية: كل الدفعات مرتّبة، مع تلوين القريب من الانتهاء أو المنتهي ============ */
 /* ============ كشوفات الجرد: تجميع سجلات الجرد المتفرّقة (صنف صنف) في "جلسات جرد" واضحة — التاريخ، المكان، ومين اللي جرد ============ */
+/* ============ سجل الحركات: عرض كل عمليات الوارد/الصادر، مع إمكانية "تراجع آمن" يرجّع الرصيد تلقائيًا لو حصل خطأ (كمية غلط، نقل مش متوفر...إلخ) ============ */
+function MovesLogTab({ currentUser, meta, lang, t }) {
+  const [moves, setMoves] = useState(null);
+  const [typeFilter, setTypeFilter] = useState("all");
+  const [search, setSearch] = useState("");
+  const [busyId, setBusyId] = useState(null);
+  const [msg, setMsg] = useState("");
+
+  useEffect(() => {
+    const unsub = MOVES_COL.orderBy("createdAt", "desc").limit(500).onSnapshot((snap) => setMoves(snap.docs.map((d) => ({ id: d.id, ...d.data() }))), () => setMoves([]));
+    return unsub;
+  }, []);
+
+  const filtered = (moves || []).filter((m) => {
+    if (typeFilter !== "all" && m.type !== typeFilter) return false;
+    const term = search.trim().toLowerCase();
+    if (!term) return true;
+    return [m.itemName, m.branch, m.note, m.enteredBy].filter(Boolean).join(" ").toLowerCase().includes(term);
+  });
+
+  async function reverseMove(m) {
+    if (m.reversed) return;
+    if (!confirm(t(`هل تريد التراجع عن هذه الحركة؟ سيتم إرجاع رصيد "${m.itemName}" تلقائيًا لما كان عليه قبلها.`, `Reverse this movement? "${m.itemName}"'s stock will be automatically restored to what it was before.`))) return;
+    setBusyId(m.id); setMsg("");
+    try {
+      const isRealBranch = m.branch && (meta.branches || []).includes(m.branch); // الحركة اتصرفت لفرع حقيقي (مش "تالف/هدر" أو "إنتاج مطبخ" وغيرها)
+      const bsRef = isRealBranch ? BRANCH_STOCK_COL.doc(branchStockDocId(m.branch, m.itemId)) : null;
+      await db.runTransaction(async (tx) => {
+        const itemRef = ITEMS_COL.doc(m.itemId);
+        const itemSnap = await tx.get(itemRef); // كل القراءات لازم تحصل قبل أي كتابة
+        const bsSnap = bsRef ? await tx.get(bsRef) : null;
+        const curQty = Number(itemSnap.data()?.qty) || 0;
+        const delta = m.type === "out" ? Number(m.qty) : -Number(m.qty); // التراجع عن صرف بيرجّع الكمية، والتراجع عن وارد بيسحبها
+        tx.update(itemRef, { qty: curQty + delta });
+        if (bsRef && bsSnap) {
+          const curBranchQty = bsSnap.exists ? (Number(bsSnap.data().qty) || 0) : 0;
+          tx.set(bsRef, { qty: Math.max(0, curBranchQty - Number(m.qty)) }, { merge: true });
+        }
+      });
+      await MOVES_COL.doc(m.id).update({ reversed: true, reversedBy: currentUser.name, reversedAt: firebase.firestore.FieldValue.serverTimestamp() });
+      setMsg("✅ " + t("تم التراجع عن الحركة وإرجاع الرصيد بنجاح", "Movement reversed and stock restored successfully"));
+    } catch (e) { setMsg("Error: " + e.message); }
+    setBusyId(null);
+  }
+
+  if (moves === null) return <div style={{ color: C.muted, padding: 20 }}>...</div>;
+
+  return (
+    <div>
+      <div style={cardStyle}>
+        <div style={cardTitle}>📜 {t("سجل حركات المستودع", "Warehouse Movement Log")}</div>
+        <div style={{ fontSize: 12.5, color: C.muted, marginBottom: 14 }}>{t("لو حصل خطأ (كمية غلط، تحويل مش متوفر في المخزون...إلخ)، تقدر \"تتراجع\" عن أي حركة والنظام هيرجّع الرصيد تلقائيًا لما كان عليه قبلها.", "If a mistake happened (wrong quantity, transfer not available in stock...etc), you can \"reverse\" any movement and the system automatically restores the stock to what it was before.")}</div>
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 14 }}>
+          <div>
+            <label style={smallLabel}>{t("النوع", "Type")}</label>
+            <select value={typeFilter} onChange={(e) => setTypeFilter(e.target.value)} style={inputStyle2}>
+              <option value="all">{t("الكل", "All")}</option>
+              <option value="in">{t("وارد", "In")}</option>
+              <option value="out">{t("صادر", "Out")}</option>
+            </select>
+          </div>
+          <div style={{ flex: "1 1 220px" }}>
+            <label style={smallLabel}>{t("بحث (الصنف، الفرع، ملاحظة، اسم المستخدم)", "Search (item, branch, note, user)")}</label>
+            <input value={search} onChange={(e) => setSearch(e.target.value)} style={inputStyle2} />
+          </div>
+        </div>
+        {msg && <div style={{ marginBottom: 10, fontSize: 13.5, color: msg.startsWith("✅") ? C.success : C.danger }}>{msg}</div>}
+        <table>
+          <thead><tr><th style={th}>{t("التاريخ", "Date")}</th><th style={th}>{t("النوع", "Type")}</th><th style={th}>{t("الصنف", "Item")}</th><th style={th}>{t("الكمية", "Qty")}</th><th style={th}>{t("الفرع/الجهة", "Branch/Destination")}</th><th style={th}>{t("ملاحظة", "Note")}</th><th style={th}>{t("بواسطة", "By")}</th><th style={th}></th></tr></thead>
+          <tbody>
+            {filtered.map((m) => (
+              <tr key={m.id} style={{ background: m.reversed ? "#f9fafb" : undefined, opacity: m.reversed ? 0.6 : 1 }}>
+                <td style={td}>{m.date}</td>
+                <td style={{ ...td, fontWeight: 700, color: m.type === "in" ? C.success : C.danger }}>{m.type === "in" ? "📥 " + t("وارد", "In") : "📤 " + t("صادر", "Out")}</td>
+                <td style={td}>{lang === "ar" ? m.itemName : (m.itemNameEn || m.itemName)}</td>
+                <td style={td}>{m.type === "in" ? "+" : "-"}{fmt(m.qty)} {m.unit}</td>
+                <td style={td}>{m.branch || m.supplierName || "—"}</td>
+                <td style={td}>{m.note || "—"}</td>
+                <td style={td}>{m.enteredBy}</td>
+                <td style={td}>
+                  {m.reversed ? (
+                    <span style={{ fontSize: 11.5, color: C.muted, fontWeight: 700 }}>↩️ {t("متراجَع عنها", "Reversed")}</span>
+                  ) : (
+                    <span onClick={() => reverseMove(m)} style={{ cursor: "pointer", color: C.danger, fontWeight: 700 }}>{busyId === m.id ? "..." : "↩️ " + t("تراجع", "Reverse")}</span>
+                  )}
+                </td>
+              </tr>
+            ))}
+            {filtered.length === 0 && <tr><td colSpan={8} style={{ ...td, textAlign: "center", color: "#9ca3af" }}>{t("لا يوجد حركات", "No movements")}</td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 function CountSessionsTab({ lang, t, institutionName }) {
   const [allCounts, setAllCounts] = useState(null);
   const [openSession, setOpenSession] = useState(null);
@@ -4317,6 +4413,7 @@ const TAB_DEFS_WH = [
   { id: "mainCount", labelAr: "جرد المستودع الرئيسي", labelEn: "Main Warehouse Count", group: "count" },
   { id: "count", labelAr: "جرد الفروع", labelEn: "Branch Count", group: "count" },
   { id: "countSessions", labelAr: "كشوفات الجرد", labelEn: "Count Statements", group: "count" },
+  { id: "movesLog", labelAr: "سجل الحركات (تراجع)", labelEn: "Movement Log (Reverse)", group: "count" },
 
   { id: "equipment", labelAr: "المعدات والصيانة", labelEn: "Equipment & Maintenance", group: "maintenance" },
   { id: "maintenanceRequest", labelAr: "طلب صيانة", labelEn: "Maintenance Request", group: "maintenance" },
@@ -4657,7 +4754,7 @@ function App() {
     : entityManagerOnly
     ? TAB_DEFS_WH.filter((tb) => tb.id === "branchRequest") // مدير الكيان يشوف تبويب واحد بس، مفيش أي حاجة تانية
     : TAB_DEFS_WH.filter((tb) => {
-        if (["items", "in", "settings", "notifs", "labels", "purchase", "expiry", "suppliers", "dashboard", "equipment", "mainCount", "branchStatement", "recipes", "variance", "countSessions"].includes(tb.id)) return canManageWarehouse(currentUser, whMeta);
+        if (["items", "in", "settings", "notifs", "labels", "purchase", "expiry", "suppliers", "dashboard", "equipment", "mainCount", "branchStatement", "recipes", "variance", "countSessions", "movesLog"].includes(tb.id)) return canManageWarehouse(currentUser, whMeta);
         return true; // out, count, reports, quickscan, branchRequest متاحة لمدير المستودع وموظفه
       });
   const effectiveTab = visibleTabs.some((tb) => tb.id === tab) ? tab : (visibleTabs[0]?.id || (maintenanceOnly ? "maintenanceRequest" : kitchenOnly ? "production" : entityManagerOnly ? "branchRequest" : "out"));
@@ -4717,6 +4814,7 @@ function App() {
         {effectiveTab === "quickscan" && <QuickScanTab currentUser={currentUser} meta={meta} lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
         {effectiveTab === "mainCount" && canManageWarehouse(currentUser, whMeta) && <MainWarehouseCountTab currentUser={currentUser} meta={meta} lang={lang} t={t} />}
         {effectiveTab === "countSessions" && canManageWarehouse(currentUser, whMeta) && <CountSessionsTab lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
+        {effectiveTab === "movesLog" && canManageWarehouse(currentUser, whMeta) && <MovesLogTab currentUser={currentUser} meta={meta} lang={lang} t={t} />}
         {effectiveTab === "count" && <BranchCountTab currentUser={currentUser} meta={meta} lang={lang} t={t} whMeta={whMeta} />}
         {effectiveTab === "items" && canManageWarehouse(currentUser, whMeta) && <ItemsTab currentUser={currentUser} lang={lang} t={t} whMeta={whMeta} meta={meta} />}
         {effectiveTab === "labels" && canManageWarehouse(currentUser, whMeta) && <BulkLabelsTab lang={lang} t={t} />}
