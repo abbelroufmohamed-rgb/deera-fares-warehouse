@@ -664,7 +664,7 @@ function ItemsTab({ currentUser, lang, t, whMeta, meta }) {
               <th style={th}>QR</th><th style={th}></th>
             </tr></thead>
             <tbody>
-              {filtered.map((it) => {
+              {filtered.slice(0, 300).map((it) => {
                 const low = it.minStock > 0 && (it.qty || 0) <= it.minStock;
                 return (
                   <tr key={it.id} style={{ background: low ? "#fef2f2" : undefined }}>
@@ -691,6 +691,7 @@ function ItemsTab({ currentUser, lang, t, whMeta, meta }) {
             </tbody>
           </table>
         </div>
+        {filtered.length > 300 && <div style={{ fontSize: 11.5, color: C.warn, marginTop: 8 }}>⚠️ {t(`فيه ${filtered.length} صنف مطابق — بنعرض أول 300 بس. ضيّق البحث أو اختار كيان معيّن عشان تلاقي غيره.`, `${filtered.length} matching items — showing the first 300 only. Narrow the search or pick an entity to find others.`)}</div>}
       </div>
 
       {showScanner && <CameraScanner onScan={onScanFound} onClose={() => setShowScanner(false)} />}
@@ -860,7 +861,7 @@ function SuggestedPurchaseTab({ lang, t, institutionName }) {
     return unsub;
   }, []);
   useEffect(() => {
-    const unsub = MOVES_COL.orderBy("createdAt", "desc").limit(3000).onSnapshot((snap) => setMoves(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
+    const unsub = MOVES_COL.orderBy("createdAt", "desc").limit(3000).onSnapshot((snap) => setMoves(snap.docs.map((d) => ({ id: d.id, ...d.data() })).filter((m) => !m.reversed))); // نستبعد الحركات المتراجَع عنها من حساب معدل الاستهلاك
     return unsub;
   }, []);
 
@@ -953,8 +954,8 @@ function SupplierStatementTab({ lang, t, institutionName }) {
   }, []);
   useEffect(() => {
     const unsub = MOVES_COL.where("type", "==", "in").orderBy("createdAt", "desc").limit(2000).onSnapshot(
-      (snap) => setMoves(snap.docs.map((d) => ({ id: d.id, ...d.data() }))),
-      () => { MOVES_COL.orderBy("createdAt", "desc").limit(3000).onSnapshot((snap) => setMoves(snap.docs.map((d) => ({ id: d.id, ...d.data() })).filter((m) => m.type === "in"))); }
+      (snap) => setMoves(snap.docs.map((d) => ({ id: d.id, ...d.data() })).filter((m) => !m.reversed)), // نستبعد الحركات المتراجَع عنها من الحسابات المالية
+      () => { MOVES_COL.orderBy("createdAt", "desc").limit(3000).onSnapshot((snap) => setMoves(snap.docs.map((d) => ({ id: d.id, ...d.data() })).filter((m) => m.type === "in" && !m.reversed))); }
     );
     return unsub;
   }, []);
@@ -1589,8 +1590,8 @@ function ConsumptionVarianceTab({ meta, lang, t, institutionName }) {
   }, []);
   useEffect(() => {
     const unsub = MOVES_COL.where("type", "==", "out").orderBy("createdAt", "desc").limit(3000).onSnapshot(
-      (snap) => setMoves(snap.docs.map((d) => ({ id: d.id, ...d.data() }))),
-      () => { MOVES_COL.orderBy("createdAt", "desc").limit(4000).onSnapshot((snap) => setMoves(snap.docs.map((d) => ({ id: d.id, ...d.data() })).filter((m) => m.type === "out"))); }
+      (snap) => setMoves(snap.docs.map((d) => ({ id: d.id, ...d.data() })).filter((m) => !m.reversed)), // نستبعد الحركات المتراجَع عنها من الحسابات
+      () => { MOVES_COL.orderBy("createdAt", "desc").limit(4000).onSnapshot((snap) => setMoves(snap.docs.map((d) => ({ id: d.id, ...d.data() })).filter((m) => m.type === "out" && !m.reversed))); }
     );
     return unsub;
   }, []);
@@ -2297,8 +2298,8 @@ function BranchStatementTab({ meta, lang, t, institutionName }) {
   useEffect(() => { if (!selectedBranch && meta.branches?.length) setSelectedBranch(meta.branches[0]); }, [meta.branches]);
   useEffect(() => {
     const unsub = MOVES_COL.where("type", "==", "out").orderBy("createdAt", "desc").limit(3000).onSnapshot(
-      (snap) => setMoves(snap.docs.map((d) => ({ id: d.id, ...d.data() }))),
-      () => { MOVES_COL.orderBy("createdAt", "desc").limit(4000).onSnapshot((snap) => setMoves(snap.docs.map((d) => ({ id: d.id, ...d.data() })).filter((m) => m.type === "out"))); }
+      (snap) => setMoves(snap.docs.map((d) => ({ id: d.id, ...d.data() })).filter((m) => !m.reversed)), // نستبعد الحركات المتراجَع عنها من الحسابات
+      () => { MOVES_COL.orderBy("createdAt", "desc").limit(4000).onSnapshot((snap) => setMoves(snap.docs.map((d) => ({ id: d.id, ...d.data() })).filter((m) => m.type === "out" && !m.reversed))); }
     );
     return unsub;
   }, []);
@@ -2507,8 +2508,8 @@ function ItemHistoryModal({ item, lang, t, onClose }) {
     return unsub;
   }, [item.id]);
 
-  const totalIn = (moves || []).filter((m) => m.type === "in").reduce((s, m) => s + (Number(m.qty) || 0), 0);
-  const totalOut = (moves || []).filter((m) => m.type === "out").reduce((s, m) => s + (Number(m.qty) || 0), 0);
+  const totalIn = (moves || []).filter((m) => m.type === "in" && !m.reversed).reduce((s, m) => s + (Number(m.qty) || 0), 0);
+  const totalOut = (moves || []).filter((m) => m.type === "out" && !m.reversed).reduce((s, m) => s + (Number(m.qty) || 0), 0);
 
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(8,15,35,0.6)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }} className="no-print">
@@ -2538,9 +2539,9 @@ function ItemHistoryModal({ item, lang, t, onClose }) {
             <thead><tr><th style={th}>{t("التاريخ", "Date")}</th><th style={th}>{t("النوع", "Type")}</th><th style={th}>{t("الكمية", "Qty")}</th><th style={th}>{t("التفاصيل", "Details")}</th><th style={th}>{t("بواسطة", "By")}</th></tr></thead>
             <tbody>
               {moves.map((m) => (
-                <tr key={m.id}>
+                <tr key={m.id} style={{ opacity: m.reversed ? 0.5 : 1 }}>
                   <td style={td}>{m.date}</td>
-                  <td style={{ ...td, fontWeight: 700, color: m.type === "in" ? C.success : C.danger }}>{m.type === "in" ? "📥 " + t("وارد", "In") : "📤 " + t("صادر", "Out")}</td>
+                  <td style={{ ...td, fontWeight: 700, color: m.type === "in" ? C.success : C.danger }}>{m.type === "in" ? "📥 " + t("وارد", "In") : "📤 " + t("صادر", "Out")} {m.reversed && <span style={{ fontSize: 10.5, color: C.muted }}>({t("متراجَع عنها", "Reversed")})</span>}</td>
                   <td style={{ ...td, fontWeight: 700 }}>{m.type === "in" ? "+" : "-"}{fmt(m.qty)}</td>
                   <td style={td}>{m.type === "in" ? (m.supplierName || t("بدون مورد", "No supplier")) : (t("لفرع:", "To branch:") + " " + (m.branch || "—"))} {m.note ? " — " + m.note : ""}</td>
                   <td style={td}>{m.enteredBy}</td>
@@ -3603,10 +3604,17 @@ function MainWarehouseCountTab({ currentUser, meta, lang, t }) {
           </div>
         </div>
         <div style={{ overflowX: "auto" }}>
+          {entityFilter === "all" && !search.trim() ? (
+            <div style={{ textAlign: "center", padding: "40px 20px", color: C.muted, background: C.blueSoft, borderRadius: 10 }}>
+              <div style={{ fontSize: 32, marginBottom: 10 }}>🔍</div>
+              <div style={{ fontWeight: 700, fontSize: 14, color: C.navy, marginBottom: 6 }}>{t("اختار كيان أو دوّر على صنف الأول", "Choose an entity or search for an item first")}</div>
+              <div style={{ fontSize: 12.5 }}>{t(`عندك ${(items || []).length} صنف مسجّل — عرضهم كلهم مرة واحدة بيبطّئ الصفحة، فلازم تفلتر الأول.`, `You have ${(items || []).length} items registered — showing them all at once slows the page down, so filter first.`)}</div>
+            </div>
+          ) : (
           <table>
             <thead><tr><th style={th}>{t("الصنف", "Item")}</th><th style={th}>🏢 {t("الكيان", "Entity")}</th><th style={th}>{t("رصيد النظام", "System qty")}</th><th style={th}>{t("الكمية الفعلية المجرودة", "Actual counted qty")}</th><th style={th}>{t("الفرق", "Diff")}</th></tr></thead>
             <tbody>
-              {filteredItems.map((it) => {
+              {filteredItems.slice(0, 300).map((it) => {
                 const c = counted[it.id];
                 const diff = c !== undefined && c !== "" ? Number(c) - Number(it.qty) : null;
                 return (
@@ -3622,8 +3630,10 @@ function MainWarehouseCountTab({ currentUser, meta, lang, t }) {
               {filteredItems.length === 0 && <tr><td colSpan={5} style={{ ...td, textAlign: "center", color: "#9ca3af" }}>{t("لا يوجد أصناف", "No items")}</td></tr>}
             </tbody>
           </table>
+          )}
+          {filteredItems.length > 300 && <div style={{ fontSize: 11.5, color: C.warn, marginTop: 8 }}>⚠️ {t(`فيه ${filteredItems.length} صنف مطابق — بنعرض أول 300 بس. ضيّق البحث أكتر لو محتاج صنف تاني.`, `${filteredItems.length} matching items — showing the first 300 only. Narrow your search for others.`)}</div>}
         </div>
-        {filteredItems.length > 0 && (
+        {filteredItems.length > 0 && !(entityFilter === "all" && !search.trim()) && (
           <div style={{ marginTop: 14 }}>
             <button onClick={submitCounts} disabled={saving} style={smallBtn}>{saving ? t("جارِ الحفظ...", "Saving...") : "💾 " + t("حفظ الجرد", "Save count")}</button>
           </div>
@@ -4132,7 +4142,7 @@ function ReportsTab({ lang, t, institutionName }) {
     return unsub;
   }, []);
   useEffect(() => {
-    const unsub = MOVES_COL.orderBy("createdAt", "desc").limit(3000).onSnapshot((snap) => setMoves(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
+    const unsub = MOVES_COL.orderBy("createdAt", "desc").limit(3000).onSnapshot((snap) => setMoves(snap.docs.map((d) => ({ id: d.id, ...d.data() })).filter((m) => !m.reversed))); // نستبعد الحركات المتراجَع عنها من كل التقارير المالية
     return unsub;
   }, []);
   useEffect(() => {
@@ -4507,7 +4517,7 @@ function WarehouseDashboard({ lang, t, setTab, meta, currentUser, whMeta }) {
     return unsub;
   }, []);
   useEffect(() => {
-    const unsub = MOVES_COL.orderBy("createdAt", "desc").limit(1000).onSnapshot((snap) => setMoves(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
+    const unsub = MOVES_COL.orderBy("createdAt", "desc").limit(1000).onSnapshot((snap) => setMoves(snap.docs.map((d) => ({ id: d.id, ...d.data() })).filter((m) => !m.reversed))); // نستبعد الحركات المتراجَع عنها من التحليل الذكي والإحصائيات
     return unsub;
   }, []);
   useEffect(() => {
