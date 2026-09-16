@@ -501,7 +501,7 @@ function ItemsTab({ currentUser, lang, t, whMeta, meta }) {
   }
 
   const filteredRaw = (items || []).filter((it) => {
-    if (entityFilter !== "all" && (it.institution || "") !== entityFilter) return false;
+    if (entityFilter !== "all" && it.institution && it.institution !== entityFilter) return false;
     const s = search.trim().toLowerCase();
     if (!s) return true;
     return (it.nameAr || "").toLowerCase().includes(s) || (it.nameEn || "").toLowerCase().includes(s) || (it.sku || "").toLowerCase().includes(s);
@@ -1195,7 +1195,7 @@ function ProductionTab({ currentUser, meta, lang, t, whMeta }) {
   }, [currentUser.name]);
 
   // موظف المطبخ يشوف بس ريسبيهات كيانه (لو مقيّد بكيان)، أو كل الريسبيهات لو مش مقيّد
-  const myRecipes = restrictedEntity ? recipes.filter((r) => (r.institution || "") === restrictedEntity) : recipes;
+  const myRecipes = restrictedEntity ? recipes.filter((r) => !r.institution || r.institution === restrictedEntity) : recipes;
   const selectedRecipe = myRecipes.find((r) => r.id === selectedRecipeId);
 
   async function submitProduction() {
@@ -3131,7 +3131,7 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin, canConfirmRec
   const [freshManagerApproval, setFreshManagerApproval] = useState(null); // طلب وافق عليه المدير حالًا، عشان نعرض تأكيد واضح فورًا
 
   const isEntityManager = !!entityManagerFor; // مدير الكيان بيوافق بس على طلبات فروع كيانه
-  const pickableItems = restrictedEntity ? items.filter((it) => (it.institution || "") === restrictedEntity) : items;
+  const pickableItems = restrictedEntity ? items.filter((it) => !it.institution || it.institution === restrictedEntity) : items;
 
   useEffect(() => {
     const unsub = ITEMS_COL.orderBy("nameAr").onSnapshot((snap) => setItems(snap.docs.map((d) => ({ id: d.id, ...d.data() }))));
@@ -3545,7 +3545,7 @@ function MainWarehouseCountTab({ currentUser, meta, lang, t }) {
   function setCountedQty(itemId, val) { setCounted((c) => ({ ...c, [itemId]: val })); }
 
   const filteredItems = (items || []).filter((it) => {
-    if (entityFilter !== "all" && (it.institution || "") !== entityFilter) return false;
+    if (entityFilter !== "all" && it.institution && it.institution !== entityFilter) return false;
     const s = search.trim().toLowerCase();
     if (!s) return true;
     return (it.nameAr || "").toLowerCase().includes(s) || (it.nameEn || "").toLowerCase().includes(s) || (it.sku || "").toLowerCase().includes(s);
@@ -3672,7 +3672,7 @@ function BranchCountTab({ currentUser, meta, lang, t, whMeta }) {
     return unsub;
   }, []);
   // لو الموظف مقيّد بكيان، ميشوفش في اختيار "أضف صنف للجرد" غير أصناف كيانه بس
-  const pickableItems = restrictedEntity ? allItems.filter((it) => (it.institution || "") === restrictedEntity) : allItems;
+  const pickableItems = restrictedEntity ? allItems.filter((it) => !it.institution || it.institution === restrictedEntity) : allItems;
   useEffect(() => {
     if (!branch) return;
     setExtraItems([]); // نصفّر الأصناف اليدوية لما نغيّر الفرع
@@ -4710,7 +4710,7 @@ function App() {
         {effectiveTab === "out" && <StockOutTab currentUser={currentUser} meta={meta} lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
         {effectiveTab === "branchRequest" && (
           <BranchRequestTab currentUser={currentUser} meta={meta} lang={lang} t={t} whMeta={whMeta}
-            isWhAdmin={canRequestForBranch(currentUser, whMeta) && !getUserEntityRestriction(currentUser, whMeta)}
+            isWhAdmin={canManageWarehouse(currentUser, whMeta)}
             canConfirmReceipt={canRequestForBranch(currentUser, whMeta)}
             entityManagerFor={isEntityManagerOnly(currentUser, whMeta) ? getUserEntityRestriction(currentUser, whMeta) : ""} />
         )}
