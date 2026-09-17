@@ -72,6 +72,13 @@ function fmt(n) {
   return v.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 function todayStr() { return new Date().toISOString().slice(0, 10); }
+/* بيحوّل Firestore Timestamp (أو أي تاريخ) لنص تاريخ وساعة مقروء — بيرجع "—" لو التاريخ لسه بيتحفظ (لحظة الكتابة نفسها) */
+function fmtDateTime(ts) {
+  if (!ts) return "—";
+  const d = ts.toDate ? ts.toDate() : new Date(ts);
+  if (isNaN(d.getTime())) return "—";
+  return d.toLocaleDateString("ar-EG", { year: "numeric", month: "2-digit", day: "2-digit" }) + " — " + d.toLocaleTimeString("ar-EG", { hour: "2-digit", minute: "2-digit" });
+}
 function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
 
 const DEFAULT_INSTITUTION_ID = "default";
@@ -3391,6 +3398,14 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin, canConfirmRec
                 </tbody>
               </table>
               {r.note && <div style={{ fontSize: 12, color: C.muted, marginTop: 6 }}>{t("ملاحظة:", "Note:")} {r.note}</div>}
+              <div style={{ display: "flex", flexWrap: "wrap", gap: "4px 18px", marginTop: 8, padding: "8px 10px", background: "#f8fafc", borderRadius: 8, fontSize: 11.5, color: C.muted }}>
+                <span>🕐 {t("طُلب:", "Requested:")} <b style={{ color: C.text }}>{fmtDateTime(r.createdAt)}</b></span>
+                {r.entityApprovedAt && <span>✅ {t("وافق مدير الكيان:", "Entity approved:")} <b style={{ color: C.text }}>{fmtDateTime(r.entityApprovedAt)}</b></span>}
+                {r.managerApprovedAt && <span>✅ {t("وافق المستودع:", "Warehouse approved:")} <b style={{ color: C.text }}>{fmtDateTime(r.managerApprovedAt)}</b></span>}
+                {r.reviewedAt && (r.status === "approved" || r.status === "partial") && <span>📦 {t("خرج فعليًا:", "Actually dispatched:")} <b style={{ color: C.text }}>{fmtDateTime(r.reviewedAt)}</b></span>}
+                {r.reviewedAt && r.status === "rejected" && <span>❌ {t("رُفض:", "Rejected:")} <b style={{ color: C.text }}>{fmtDateTime(r.reviewedAt)}</b></span>}
+                {r.entityApprovedAt && r.status === "rejected" && !r.managerApprovedAt && <span>❌ {t("رُفض من مدير الكيان:", "Rejected by entity manager:")} <b style={{ color: C.text }}>{fmtDateTime(r.entityApprovedAt)}</b></span>}
+              </div>
               {isEntityManager && r.status === "pending_entity" && (
                 <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
                   <button onClick={() => entityManagerApprove(r, true)} disabled={saving} style={smallBtn}>✅ {t("موافقة كاملة (الكميات المطلوبة كلها)", "Approve fully (all requested quantities)")}</button>
