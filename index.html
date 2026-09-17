@@ -3726,7 +3726,10 @@ function BranchCountTab({ currentUser, meta, lang, t, whMeta }) {
     setAddItemPick(null); setMsg("");
   }
 
-  const fullList = [...branchStock, ...extraItems];
+  const fullList = [...branchStock, ...extraItems].map((b) => {
+    const itemInfo = allItems.find((it) => it.id === b.itemId);
+    return { ...b, price: itemInfo ? (Number(itemInfo.price) || 0) : 0 };
+  });
 
   async function submitCounts() {
     const toSubmit = fullList.filter((b) => counted[b.itemId] !== undefined && counted[b.itemId] !== "");
@@ -3739,7 +3742,8 @@ function BranchCountTab({ currentUser, meta, lang, t, whMeta }) {
         const systemQty = Number(b.qty) || 0;
         const diff = countedQty - systemQty;
         await COUNTS_COL.add({
-          branch, itemId: b.itemId, itemName: b.itemName, systemQty, countedQty, diff, date: todayStr(),
+          branch, itemId: b.itemId, itemName: b.itemName, systemQty, countedQty, diff,
+          price: b.price, diffValue: diff * b.price, date: todayStr(),
           countedBy: currentUser.name, institutionId: DEFAULT_INSTITUTION_ID, createdAt: firebase.firestore.FieldValue.serverTimestamp(),
         });
         await BRANCH_STOCK_COL.doc(branchStockDocId(branch, b.itemId)).set({ branch, itemId: b.itemId, itemName: b.itemName, qty: countedQty, institutionId: DEFAULT_INSTITUTION_ID }, { merge: true }); // الجرد بيصحّح الرصيد ليبقى نقطة البداية الجديدة (وبيُنشئ سجل جديد لو الصنف مضاف يدويًا)
@@ -3780,23 +3784,57 @@ function BranchCountTab({ currentUser, meta, lang, t, whMeta }) {
             <button onClick={addItemToCount} style={ghostBtn}>➕ {t("أضف للجرد", "Add to count")}</button>
           </div>
         </div>
+        {fullList.length > 0 && (() => {
+          const totalExpectedValue = fullList.reduce((s, b) => s + Number(b.qty) * b.price, 0);
+          const countedRows = fullList.filter((b) => counted[b.itemId] !== undefined && counted[b.itemId] !== "");
+          const totalCountedValue = countedRows.reduce((s, b) => s + Number(counted[b.itemId]) * b.price, 0);
+          const totalDiffValue = countedRows.reduce((s, b) => s + (Number(counted[b.itemId]) - Number(b.qty)) * b.price, 0);
+          return (
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 14 }}>
+              <div style={{ flex: "1 1 180px", background: C.blueSoft, borderRadius: 10, padding: "10px 14px" }}>
+                <div style={{ fontSize: 11.5, color: C.muted }}>{t("إجمالي القيمة المتوقعة", "Total expected value")}</div>
+                <div style={{ fontSize: 17, fontWeight: 800, color: C.navy }}>{fmt(totalExpectedValue)} {t("ر.س", "SAR")}</div>
+              </div>
+              <div style={{ flex: "1 1 180px", background: C.blueSoft, borderRadius: 10, padding: "10px 14px" }}>
+                <div style={{ fontSize: 11.5, color: C.muted }}>{t("إجمالي القيمة المجرودة (حتى الآن)", "Total counted value (so far)")}</div>
+                <div style={{ fontSize: 17, fontWeight: 800, color: C.navy }}>{fmt(totalCountedValue)} {t("ر.س", "SAR")}</div>
+              </div>
+              <div style={{ flex: "1 1 180px", borderRadius: 10, padding: "10px 14px", background: totalDiffValue < 0 ? "#fef2f2" : totalDiffValue > 0 ? "#f0fdf4" : C.blueSoft }}>
+                <div style={{ fontSize: 11.5, color: C.muted }}>{t("إجمالي فرق القيمة", "Total value difference")}</div>
+                <div style={{ fontSize: 17, fontWeight: 800, color: totalDiffValue < 0 ? C.danger : totalDiffValue > 0 ? C.success : C.navy }}>{totalDiffValue > 0 ? "+" : ""}{fmt(totalDiffValue)} {t("ر.س", "SAR")}</div>
+              </div>
+            </div>
+          );
+        })()}
         <div style={{ overflowX: "auto" }}>
           <table>
-            <thead><tr><th style={th}>{t("الصنف", "Item")}</th><th style={th}>{t("المتوقع (حسب النظام)", "Expected (system)")}</th><th style={th}>{t("الكمية الفعلية المجرودة", "Actual counted qty")}</th><th style={th}>{t("الفرق", "Diff")}</th></tr></thead>
+            <thead><tr>
+              <th style={th}>{t("الصنف", "Item")}</th>
+              <th style={th}>{t("المتوقع (كمية)", "Expected (qty)")}</th><th style={th}>{t("المتوقع (مبلغ)", "Expected (value)")}</th>
+              <th style={th}>{t("الفعلي المجرود (كمية)", "Counted (qty)")}</th><th style={th}>{t("الفعلي المجرود (مبلغ)", "Counted (value)")}</th>
+              <th style={th}>{t("فرق الكمية", "Qty diff")}</th><th style={th}>{t("فرق المبلغ", "Value diff")}</th>
+            </tr></thead>
             <tbody>
               {fullList.map((b) => {
                 const c = counted[b.itemId];
-                const diff = c !== undefined && c !== "" ? Number(c) - Number(b.qty) : null;
+                const hasCount = c !== undefined && c !== "";
+                const diff = hasCount ? Number(c) - Number(b.qty) : null;
+                const expectedValue = Number(b.qty) * b.price;
+                const countedValue = hasCount ? Number(c) * b.price : null;
+                const diffValue = hasCount ? diff * b.price : null;
                 return (
                   <tr key={b.id}>
                     <td style={{ ...td, fontWeight: 700 }}>{b.itemName}{b.id.startsWith("extra_") && <span style={{ fontSize: 10.5, color: C.blue, marginRight: 6 }}>({t("مضاف يدويًا", "manually added")})</span>}</td>
                     <td style={td}>{fmt(b.qty)}</td>
+                    <td style={td}>{fmt(expectedValue)}</td>
                     <td style={td}><input type="number" step="0.01" value={c || ""} onChange={(e) => setCountedQty(b.itemId, e.target.value)} style={{ ...inputStyle2, width: 110 }} /></td>
+                    <td style={td}>{countedValue === null ? "—" : fmt(countedValue)}</td>
                     <td style={{ ...td, fontWeight: 700, color: diff === null ? C.muted : diff < 0 ? C.danger : diff > 0 ? C.success : C.muted }}>{diff === null ? "—" : (diff > 0 ? "+" : "") + fmt(diff)}</td>
+                    <td style={{ ...td, fontWeight: 700, color: diffValue === null ? C.muted : diffValue < 0 ? C.danger : diffValue > 0 ? C.success : C.muted }}>{diffValue === null ? "—" : (diffValue > 0 ? "+" : "") + fmt(diffValue)}</td>
                   </tr>
                 );
               })}
-              {fullList.length === 0 && <tr><td colSpan={4} style={{ ...td, textAlign: "center", color: "#9ca3af" }}>{t("مفيش أصناف — أضف صنف يدويًا فوق للبدء", "No items — add one manually above to get started")}</td></tr>}
+              {fullList.length === 0 && <tr><td colSpan={7} style={{ ...td, textAlign: "center", color: "#9ca3af" }}>{t("مفيش أصناف — أضف صنف يدويًا فوق للبدء", "No items — add one manually above to get started")}</td></tr>}
             </tbody>
           </table>
         </div>
@@ -3812,16 +3850,17 @@ function BranchCountTab({ currentUser, meta, lang, t, whMeta }) {
         <div style={cardTitle}>🕒 {t("آخر عمليات الجرد لهذا الفرع", "Recent counts for this branch")}</div>
         <div style={{ overflowX: "auto" }}>
           <table>
-            <thead><tr><th style={th}>{t("التاريخ", "Date")}</th><th style={th}>{t("الصنف", "Item")}</th><th style={th}>{t("متوقع", "Expected")}</th><th style={th}>{t("فعلي", "Counted")}</th><th style={th}>{t("الفرق", "Diff")}</th><th style={th}>{t("بواسطة", "By")}</th></tr></thead>
+            <thead><tr><th style={th}>{t("التاريخ", "Date")}</th><th style={th}>{t("الصنف", "Item")}</th><th style={th}>{t("متوقع", "Expected")}</th><th style={th}>{t("فعلي", "Counted")}</th><th style={th}>{t("الفرق", "Diff")}</th><th style={th}>{t("فرق القيمة", "Value diff")}</th><th style={th}>{t("بواسطة", "By")}</th></tr></thead>
             <tbody>
               {history.map((h) => (
                 <tr key={h.id}>
                   <td style={td}>{h.date}</td><td style={td}>{h.itemName}</td><td style={td}>{fmt(h.systemQty)}</td><td style={td}>{fmt(h.countedQty)}</td>
                   <td style={{ ...td, fontWeight: 700, color: h.diff < 0 ? C.danger : h.diff > 0 ? C.success : C.muted }}>{h.diff > 0 ? "+" : ""}{fmt(h.diff)}</td>
+                  <td style={{ ...td, fontWeight: 700, color: h.diffValue < 0 ? C.danger : h.diffValue > 0 ? C.success : C.muted }}>{h.diffValue !== undefined ? (h.diffValue > 0 ? "+" : "") + fmt(h.diffValue) : "—"}</td>
                   <td style={td}>{h.countedBy}</td>
                 </tr>
               ))}
-              {history.length === 0 && <tr><td colSpan={6} style={{ ...td, textAlign: "center", color: "#9ca3af" }}>{t("لا يوجد جرد سابق", "No previous counts")}</td></tr>}
+              {history.length === 0 && <tr><td colSpan={7} style={{ ...td, textAlign: "center", color: "#9ca3af" }}>{t("لا يوجد جرد سابق", "No previous counts")}</td></tr>}
             </tbody>
           </table>
         </div>
