@@ -124,6 +124,13 @@ function isMaintenanceResponsible(currentUser, whMeta) { const r = getWarehouseR
 function isMaintenanceOnly(currentUser, whMeta) { return getWarehouseRole(currentUser, whMeta) === "wh_maintenance"; }
 function isKitchenOnly(currentUser, whMeta) { return getWarehouseRole(currentUser, whMeta) === "wh_kitchen"; }
 function isEntityManagerOnly(currentUser, whMeta) { return getWarehouseRole(currentUser, whMeta) === "wh_entity_manager"; }
+/* بيتأكد لو فيه أي مستخدم متعيّن فعليًا بدور "مدير كيان" لنفس الكيان ده تحديدًا — يستخدم عشان نعرف نسمح بالموافقة الذاتية من غيره ولا لأ */
+function hasEntityManagerFor(entity, users, whMeta) {
+  if (!entity || !users) return false;
+  const roles = (whMeta && whMeta.userRoles) || {};
+  const entities = (whMeta && whMeta.userEntity) || {};
+  return users.some((u) => roles[u.id] === "wh_entity_manager" && entities[u.id] === entity);
+}
 const WAREHOUSE_ROLE_LABELS = { wh_admin: "مدير مستودع", wh_staff: "موظف مستودع", wh_maintenance: "مسؤول صيانة", wh_kitchen: "موظف مطبخ/إنتاج", wh_entity_manager: "مدير كيان" };
 /* لو الموظف مقيّد بكيان معيّن (whMeta.userEntity)، بيشوف بضاعة هذا الكيان بس — فاضي/غير موجود = يشوف كل الكيانات */
 function getUserEntityRestriction(currentUser, whMeta) {
@@ -313,23 +320,41 @@ function branchStockDocId(branch, itemId) { return branch + "__" + itemId; }
 /* ============ استنزاف الدفعات بنظام FIFO (الأقرب صلاحية يتصرف الأول تلقائيًا) — بتتنادى بعد أي عملية صرف ============
    ملاحظة: لو الكمية المصروفة أكبر من مجموع الدفعات المتتبّعة (يعني فيه وارد قديم بدون تاريخ صلاحية)، البقية بتتخصم
    من "الرصيد الغير متتبّع بدفعة" ضمنيًا (مفيش حاجة تتعمل له، لأنه أصلاً مش مسجّل كدفعة). */
+/* بيستنزف الدفعات بنظام "الأقدم أولًا" (للصلاحية لو موجودة، وإلا فبتاريخ الاستلام)، وبيرجّع تكلفة الاستهلاك الموزونة
+   الفعلية (weighted cost) بناءً على أسعار الدفعات اللي اتاخد منها فعلًا — مش سعر الصنف الحالي في الكتالوج */
 async function depleteBatchesFIFO(itemId, qtyToDeplete) {
   let remaining = Number(qtyToDeplete) || 0;
-  if (remaining <= 0.009) return;
+  if (remaining <= 0.009) return null;
   try {
     const snap = await BATCHES_COL.where("itemId", "==", itemId).get();
     const batches = snap.docs
       .map((d) => ({ id: d.id, ...d.data() }))
       .filter((b) => (Number(b.remainingQty ?? b.qty) || 0) > 0.009)
-      .sort((a, b) => (a.expiryDate || "9999-12-31").localeCompare(b.expiryDate || "9999-12-31")); // الأقرب صلاحية أول عنصر
+      .sort((a, b) => (a.expiryDate || a.receivedDate || "9999-12-31").localeCompare(b.expiryDate || b.receivedDate || "9999-12-31")); // الأقدم (صلاحية أو استلام) أول عنصر
+    let costTotal = 0, costedQty = 0;
     for (const b of batches) {
       if (remaining <= 0.009) break;
       const avail = Number(b.remainingQty ?? b.qty) || 0;
       const take = Math.min(avail, remaining);
       await BATCHES_COL.doc(b.id).update({ remainingQty: avail - take });
+      if (b.price !== undefined) { costTotal += take * Number(b.price); costedQty += take; }
       remaining -= take;
     }
-  } catch (e) { /* الاستنزاف التلقائي أفضل-جهد ممكن — أي خطأ فيه ما يوقفش عملية الصرف الأساسية */ }
+    // لو الكمية المطلوبة أكبر من كل الدفعات المتتبّعة (وارد قديم من غير دفعات)، الباقي بيتقيّم بسعر الصنف الحالي
+    return costedQty > 0 ? { avgCost: costTotal / costedQty, costedQty } : null;
+  } catch (e) { return null; /* الاستنزاف التلقائي أفضل-جهد ممكن — أي خطأ فيه ما يوقفش عملية الصرف الأساسية */ }
+}
+/* بيرجع "السعر الفعلي الحالي" للصنف — سعر أقدم دفعة لسه فيها رصيد (يعني السعر اللي بيتحسب بيه الصرف دلوقتي)،
+   أو سعر الكتالوج العادي لو مفيش دفعات متتبّعة أو خلصت كلها */
+async function getCurrentBatchPrice(itemId, fallbackPrice) {
+  try {
+    const snap = await BATCHES_COL.where("itemId", "==", itemId).get();
+    const batches = snap.docs
+      .map((d) => ({ id: d.id, ...d.data() }))
+      .filter((b) => (Number(b.remainingQty ?? b.qty) || 0) > 0.009 && b.price !== undefined)
+      .sort((a, b) => (a.expiryDate || a.receivedDate || "9999-12-31").localeCompare(b.expiryDate || b.receivedDate || "9999-12-31"));
+    return batches.length > 0 ? Number(batches[0].price) : fallbackPrice;
+  } catch (e) { return fallbackPrice; }
 }
 
 /* ============ شاشة إدارة الأصناف: إضافة/تعديل صنف بكوده وسعره وحده الأدنى — ثنائية اللغة ============ */
@@ -2754,7 +2779,8 @@ function StockInTab({ currentUser, lang, t }) {
           const ref = ITEMS_COL.doc(line.itemId);
           const snap = await tx.get(ref);
           const curQty = Number(snap.data().qty) || 0;
-          tx.update(ref, { qty: curQty + line.qty });
+          // نحدّث رصيد الصنف، وكمان سعر الكتالوج ليبقى آخر سعر شراء (السعر القديم هيفضل محفوظ في دفعته الخاصة لحد ما تخلص)
+          tx.update(ref, { qty: curQty + line.qty, price: line.unitCost });
           tx.set(MOVES_COL.doc(), {
             itemId: line.itemId, itemName: line.itemName, itemNameEn: line.itemNameEn, unit: line.unit,
             type: "in", qty: line.qty, unitCost: line.unitCost, purchaseValue, vatAmount, date: invoiceDate,
@@ -2764,13 +2790,13 @@ function StockInTab({ currentUser, lang, t }) {
             createdAt: firebase.firestore.FieldValue.serverTimestamp(),
           });
         });
-        if (line.expiryDate) {
-          await BATCHES_COL.add({
-            itemId: line.itemId, itemName: line.itemName, itemNameEn: line.itemNameEn, unit: line.unit,
-            qty: line.qty, remainingQty: line.qty, expiryDate: line.expiryDate, receivedDate: invoiceDate, invoiceNo: invoiceNo.trim(),
-            institutionId: DEFAULT_INSTITUTION_ID, createdAt: firebase.firestore.FieldValue.serverTimestamp(),
-          });
-        }
+        // نسجّل دفعة تكلفة دايمًا (مش بس لو فيه صلاحية) — عشان نتبّع سعر كل وارد لحد ما يتصرف بالكامل (نظام "الأقدم يتصرف أولًا" للتسعير)
+        await BATCHES_COL.add({
+          itemId: line.itemId, itemName: line.itemName, itemNameEn: line.itemNameEn, unit: line.unit,
+          qty: line.qty, remainingQty: line.qty, price: line.unitCost,
+          expiryDate: line.expiryDate || "", receivedDate: invoiceDate, invoiceNo: invoiceNo.trim(),
+          institutionId: DEFAULT_INSTITUTION_ID, createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+        });
       }
       setMsg("✅ " + t(`تم حفظ الفاتورة بنجاح (${lines.length} صنف) وإضافتهم للمخزون`, `Invoice saved successfully (${lines.length} item(s)) and added to stock`));
       setLines([]); setSupplierName(""); setTaxNumber(""); setInvoiceNo(""); setInvoiceDate(todayStr());
@@ -2929,7 +2955,8 @@ function StockOutTab({ currentUser, meta, lang, t, institutionName }) {
           createdAt: firebase.firestore.FieldValue.serverTimestamp(),
         });
       });
-      await depleteBatchesFIFO(selectedItem.id, q); // استنزاف الدفعات بنظام الأقرب صلاحية أولًا
+      const costInfo = await depleteBatchesFIFO(selectedItem.id, q); // استنزاف الدفعات بنظام الأقدم أولًا، وحساب التكلفة الفعلية الموزونة
+      if (costInfo && moveId) await MOVES_COL.doc(moveId).update({ costPrice: costInfo.avgCost });
       setMsg("✅ " + t(`تم صرف ${fmt(q)} ${selectedItem.unit} لفرع ${branch}`, `Issued ${fmt(q)} ${selectedItem.unit} to ${branch}`));
       setFreshVoucher({ id: moveId, itemName: selectedItem.nameAr, itemNameEn: selectedItem.nameEn, unit: selectedItem.unit, qty: q, price: selectedItem.price, branch, date: todayStr(), note, enteredBy: currentUser.name });
       setSelectedItem(null); setQty(""); setNote("");
@@ -3039,6 +3066,7 @@ function QuickScanTab({ currentUser, meta, lang, t, institutionName }) {
     if (!pendingItem || !q || q <= 0) return;
     setSaving(true);
     try {
+      let moveId;
       const bsRef = BRANCH_STOCK_COL.doc(branchStockDocId(branch, pendingItem.id));
       await db.runTransaction(async (tx) => {
         const ref = ITEMS_COL.doc(pendingItem.id);
@@ -3048,14 +3076,17 @@ function QuickScanTab({ currentUser, meta, lang, t, institutionName }) {
         const curBranchQty = bsSnap.exists ? (Number(bsSnap.data().qty) || 0) : 0;
         tx.update(ref, { qty: curQty - q });
         tx.set(bsRef, { branch, itemId: pendingItem.id, itemName: pendingItem.nameAr, qty: curBranchQty + q, institutionId: DEFAULT_INSTITUTION_ID }, { merge: true });
-        tx.set(MOVES_COL.doc(), {
+        const moveRef = MOVES_COL.doc();
+        moveId = moveRef.id;
+        tx.set(moveRef, {
           itemId: pendingItem.id, itemName: pendingItem.nameAr, itemNameEn: pendingItem.nameEn, unit: pendingItem.unit,
           price: pendingItem.price, type: "out", qty: q, branch, date: todayStr(),
           note: t("مسح سريع", "Quick scan"), enteredBy: currentUser.name, institutionId: DEFAULT_INSTITUTION_ID,
           createdAt: firebase.firestore.FieldValue.serverTimestamp(),
         });
       });
-      await depleteBatchesFIFO(pendingItem.id, q); // استنزاف الدفعات بنظام الأقرب صلاحية أولًا
+      const costInfo = await depleteBatchesFIFO(pendingItem.id, q); // استنزاف الدفعات بنظام الأقدم أولًا، وحساب التكلفة الفعلية الموزونة
+      if (costInfo && moveId) await MOVES_COL.doc(moveId).update({ costPrice: costInfo.avgCost });
       setSessionLog((log) => [{ name: lang === "ar" ? pendingItem.nameAr : (pendingItem.nameEn || pendingItem.nameAr), qty: q, unit: pendingItem.unit }, ...log]);
       setPendingItem(null); setQty("1");
       setShowScanner(true); // يفتح الكاميرا تلقائيًا للصنف التالي
@@ -3118,7 +3149,7 @@ function QuickScanTab({ currentUser, meta, lang, t, institutionName }) {
 
 /* ============ شاشة جرد الفروع: تحديد الكمية الفعلية لكل صنف بفرع معيّن، ومقارنتها بالمتوقع، وإرسال إشعار نقص ============ */
 /* ============ طلب الفرع من المستودع الرئيسي: 3 مراحل — موظف الفرع يطلب ← مدير الكيان يوافق ← مدير المستودع يوافق ← الفرع يأكّد الاستلام ============ */
-function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin, canConfirmReceipt, entityManagerFor, whMeta }) {
+function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin, canConfirmReceipt, entityManagerFor, selfApproveEntity, whMeta }) {
   const restrictedBranch = getUserBranchRestriction(currentUser, whMeta);
   const restrictedEntity = getUserEntityRestriction(currentUser, whMeta);
   const [items, setItems] = useState([]);
@@ -3137,8 +3168,15 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin, canConfirmRec
   const [receiveQtys, setReceiveQtys] = useState({}); // { requestId_lineIdx: qty } — مرحلة تأكيد الاستلام
   const [freshApproval, setFreshApproval] = useState(null); // طلب اتأكد استلامه حالًا، عشان نعرض ورقة طباعة فورية
   const [freshManagerApproval, setFreshManagerApproval] = useState(null); // طلب وافق عليه المدير حالًا، عشان نعرض تأكيد واضح فورًا
+  const [showDriverReceipt, setShowDriverReceipt] = useState(false);
 
   const isEntityManager = !!entityManagerFor; // مدير الكيان بيوافق بس على طلبات فروع كيانه
+  /* بيتأكد لو الطلب ده يقدر يتوافق عليه في مرحلة الكيان — إما مدير كيان حقيقي لنفس الكيان، أو موظف الفرع نفسه (لو مفيش مدير كيان معيّن لكيانه) */
+  function canApproveEntityStage(req) {
+    if (isEntityManager && req.branchEntity === entityManagerFor) return true;
+    if (selfApproveEntity && req.branchEntity === selfApproveEntity && req.requestedBy === currentUser.name) return true;
+    return false;
+  }
   const pickableItems = restrictedEntity ? items.filter((it) => !it.institution || it.institution === restrictedEntity) : items;
 
   useEffect(() => {
@@ -3250,6 +3288,7 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin, canConfirmRec
       for (const l of finalLines) {
         if (l.qtyReceived <= 0) continue;
         const bsRef = BRANCH_STOCK_COL.doc(branchStockDocId(req.branch, l.itemId));
+        let moveId;
         await db.runTransaction(async (tx) => {
           const ref = ITEMS_COL.doc(l.itemId);
           const bsSnap = await tx.get(bsRef); // كل القراءات لازم تحصل قبل أي كتابة في معاملة Firestore
@@ -3258,7 +3297,9 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin, canConfirmRec
           const curBranchQty = bsSnap.exists ? (Number(bsSnap.data().qty) || 0) : 0;
           tx.update(ref, { qty: curQty - l.qtyReceived });
           tx.set(bsRef, { branch: req.branch, itemId: l.itemId, itemName: l.itemName, qty: curBranchQty + l.qtyReceived, institutionId: DEFAULT_INSTITUTION_ID }, { merge: true });
-          tx.set(MOVES_COL.doc(), {
+          const moveRef = MOVES_COL.doc();
+          moveId = moveRef.id;
+          tx.set(moveRef, {
             itemId: l.itemId, itemName: l.itemName, itemNameEn: l.itemNameEn, unit: l.unit,
             type: "out", qty: l.qtyReceived, branch: req.branch, date: todayStr(),
             note: t("تنفيذ طلب فرع (بعد تأكيد الاستلام)", "Branch request fulfillment (after receipt confirmation)") + " #" + req.id.slice(0, 6),
@@ -3266,7 +3307,8 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin, canConfirmRec
             createdAt: firebase.firestore.FieldValue.serverTimestamp(),
           });
         });
-        await depleteBatchesFIFO(l.itemId, l.qtyReceived); // استنزاف الدفعات بنظام الأقرب صلاحية أولًا
+        const costInfo = await depleteBatchesFIFO(l.itemId, l.qtyReceived); // استنزاف الدفعات بنظام الأقدم أولًا، وحساب التكلفة الفعلية الموزونة
+        if (costInfo && moveId) await MOVES_COL.doc(moveId).update({ costPrice: costInfo.avgCost });
       }
       const allFulfilled = finalLines.every((l) => l.qtyReceived >= l.qtyRequested);
       await REQUESTS_COL.doc(req.id).update({
@@ -3368,23 +3410,27 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin, canConfirmRec
               </div>
               <table>
                 <thead><tr>
-                  <th style={th}>{t("الصنف", "Item")}</th><th style={th}>{t("المطلوب", "Requested")}</th>
+                  <th style={th}>{t("الصنف", "Item")}</th><th style={th}>{t("المطلوب", "Requested")}</th><th style={th}>{t("القيمة التقديرية", "Estimated value")}</th>
                   {r.status !== "pending_entity" && <th style={th}>{t("وافق عليه مدير الكيان", "Entity manager approved")}</th>}
                   {(r.status === "awaiting_receipt" || r.status === "approved" || r.status === "partial") && <th style={th}>{t("وافق عليه المستودع", "Warehouse approved")}</th>}
                   {(r.status === "approved" || r.status === "partial") && <th style={th}>{t("المستلم فعليًا", "Actually received")}</th>}
-                  {isEntityManager && r.status === "pending_entity" && <th style={th}>{t("كمية موافقة مدير الكيان", "Entity manager approve qty")}</th>}
+                  {canApproveEntityStage(r) && r.status === "pending_entity" && <th style={th}>{t("كمية موافقة مدير الكيان", "Entity manager approve qty")}</th>}
                   {isWhAdmin && r.status === "pending_warehouse" && <th style={th}>{t("كمية موافقة المستودع", "Warehouse approve qty")}</th>}
                   {canConfirmReceipt && r.status === "awaiting_receipt" && <th style={th}>{t("الكمية المستلمة فعليًا", "Actual received qty")}</th>}
                 </tr></thead>
                 <tbody>
-                  {r.lines.map((l, i) => (
+                  {r.lines.map((l, i) => {
+                    const itemInfo = items.find((it) => it.id === l.itemId);
+                    const price = itemInfo ? Number(itemInfo.price) || 0 : 0;
+                    return (
                     <tr key={i}>
                       <td style={td}>{lang === "ar" ? l.itemName : (l.itemNameEn || l.itemName)}</td>
                       <td style={td}>{fmt(l.qtyRequested)} {l.unit}</td>
+                      <td style={td}>{fmt(l.qtyRequested * price)} {t("ر.س", "SAR")}</td>
                       {r.status !== "pending_entity" && <td style={td}>{fmt(l.qtyEntityApproved)}</td>}
                       {(r.status === "awaiting_receipt" || r.status === "approved" || r.status === "partial") && <td style={td}>{fmt(l.qtyApproved)}</td>}
                       {(r.status === "approved" || r.status === "partial") && <td style={{ ...td, color: l.qtyReceived >= l.qtyRequested ? C.success : C.warn, fontWeight: 700 }}>{fmt(l.qtyReceived)}</td>}
-                      {isEntityManager && r.status === "pending_entity" && (
+                      {canApproveEntityStage(r) && r.status === "pending_entity" && (
                         <td style={td}><input type="number" step="0.01" placeholder={String(l.qtyRequested)} onChange={(e) => setEntityApproveQtys((a) => ({ ...a, [r.id + "_" + i]: e.target.value }))} style={{ ...inputStyle2, width: 100 }} /></td>
                       )}
                       {isWhAdmin && r.status === "pending_warehouse" && (
@@ -3394,7 +3440,7 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin, canConfirmRec
                         <td style={td}><input type="number" step="0.01" placeholder={String(l.qtyApproved)} onChange={(e) => setReceiveQtys((a) => ({ ...a, [r.id + "_" + i]: e.target.value }))} style={{ ...inputStyle2, width: 100 }} /></td>
                       )}
                     </tr>
-                  ))}
+                  );})}
                 </tbody>
               </table>
               {r.note && <div style={{ fontSize: 12, color: C.muted, marginTop: 6 }}>{t("ملاحظة:", "Note:")} {r.note}</div>}
@@ -3406,7 +3452,7 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin, canConfirmRec
                 {r.reviewedAt && r.status === "rejected" && <span>❌ {t("رُفض:", "Rejected:")} <b style={{ color: C.text }}>{fmtDateTime(r.reviewedAt)}</b></span>}
                 {r.entityApprovedAt && r.status === "rejected" && !r.managerApprovedAt && <span>❌ {t("رُفض من مدير الكيان:", "Rejected by entity manager:")} <b style={{ color: C.text }}>{fmtDateTime(r.entityApprovedAt)}</b></span>}
               </div>
-              {isEntityManager && r.status === "pending_entity" && (
+              {canApproveEntityStage(r) && r.status === "pending_entity" && (
                 <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
                   <button onClick={() => entityManagerApprove(r, true)} disabled={saving} style={smallBtn}>✅ {t("موافقة كاملة (الكميات المطلوبة كلها)", "Approve fully (all requested quantities)")}</button>
                   <button onClick={() => entityManagerApprove(r, false)} disabled={saving} style={ghostBtn}>{t("موافقة بالكميات المكتوبة فوق", "Approve with amounts entered above")}</button>
@@ -3439,7 +3485,8 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin, canConfirmRec
         </div>
       </div>
 
-      {freshManagerApproval && <ManagerApprovalConfirm req={freshManagerApproval} lang={lang} t={t} onClose={() => setFreshManagerApproval(null)} />}
+      {freshManagerApproval && <ManagerApprovalConfirm req={freshManagerApproval} lang={lang} t={t} onClose={() => setFreshManagerApproval(null)} onShowDriverReceipt={() => setShowDriverReceipt(true)} />}
+      {showDriverReceipt && freshManagerApproval && <DriverDeliveryReceipt req={freshManagerApproval} lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} onClose={() => setShowDriverReceipt(false)} />}
       {freshApproval && <BranchRequestVoucher req={freshApproval} lang={lang} t={t} onClose={() => setFreshApproval(null)} />}
     </div>
   );
@@ -3447,7 +3494,7 @@ function BranchRequestTab({ currentUser, meta, lang, t, isWhAdmin, canConfirmRec
 
 /* ============ ورقة طباعة رسمية لتنفيذ طلب فرع: مين طلب، مين وافق، الفرع، التاريخ، والأصناف بالكميات المنفَّذة ============ */
 /* ============ تأكيد واضح فوري بعد موافقة مدير المستودع (المرحلة الأولى) — مع خيار طباعة قبل ما ينتقل الطلب لمرحلة الاستلام ============ */
-function ManagerApprovalConfirm({ req, lang, t, onClose }) {
+function ManagerApprovalConfirm({ req, lang, t, onClose, onShowDriverReceipt }) {
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(8,15,35,0.6)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }} className="no-print">
       <div style={{ background: "#fff", borderRadius: 16, padding: 30, maxWidth: 420, width: "100%" }}>
@@ -3470,6 +3517,57 @@ function ManagerApprovalConfirm({ req, lang, t, onClose }) {
               ))}
             </tbody>
           </table>
+        </div>
+        <div style={{ display: "flex", gap: 10, justifyContent: "center", marginTop: 20, flexWrap: "wrap" }} className="no-print">
+          <button onClick={() => window.print()} style={smallBtn}>🖨️ {t("طباعة", "Print")}</button>
+          <button onClick={onShowDriverReceipt} style={{ ...smallBtn, background: "#7c3aed" }}>🚚 {t("إيصال تسليم للسائق", "Driver Delivery Receipt")}</button>
+          <button onClick={onClose} style={ghostBtn}>{t("إغلاق", "Close")}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============ إيصال تسليم/استلام للسائق: مستند منفصل بيتنقّل مع البضاعة فعليًا — من (المستودع) إلى (الفرع)، بخانتي توقيع للتسليم والاستلام ============ */
+function DriverDeliveryReceipt({ req, lang, t, institutionName, onClose }) {
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(8,15,35,0.6)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }} className="no-print">
+      <div style={{ background: "#fff", borderRadius: 16, padding: 30, maxWidth: 480, width: "100%", maxHeight: "88vh", overflowY: "auto" }}>
+        <div className="print-area">
+          <div className="print-only-header"><h2>{institutionName}</h2><div>{t("إيصال تسليم بضاعة للسائق", "Driver Goods Delivery Receipt")}</div></div>
+          <div style={{ textAlign: "center", marginBottom: 16 }}>
+            <div style={{ fontSize: 40, marginBottom: 6 }}>🚚</div>
+            <div style={{ fontWeight: 800, fontSize: 17, color: C.navy }}>{t("إيصال تسليم بضاعة", "Goods Delivery Receipt")}</div>
+            <div style={{ fontSize: 12, color: C.muted }}>{t("رقم الطلب:", "Request #:")} {req.id.slice(0, 8)}</div>
+          </div>
+          <table style={{ marginBottom: 14 }}>
+            <tbody>
+              <tr><td style={{ ...td, fontWeight: 700, width: 140 }}>{t("من", "From")}</td><td style={{ ...td, fontWeight: 700 }}>{t("المستودع الرئيسي", "Main Warehouse")}</td></tr>
+              <tr><td style={{ ...td, fontWeight: 700 }}>{t("إلى", "To")}</td><td style={{ ...td, fontWeight: 700 }}>{req.branch}</td></tr>
+              <tr><td style={{ ...td, fontWeight: 700 }}>{t("التاريخ", "Date")}</td><td style={td}>{req.managerApprovedAtDate || todayStr()}</td></tr>
+              <tr><td style={{ ...td, fontWeight: 700 }}>{t("اسم السائق (يُكتب يدويًا)", "Driver name (handwritten)")}</td><td style={td}>______________</td></tr>
+            </tbody>
+          </table>
+          <div style={{ fontWeight: 700, fontSize: 13.5, color: C.navy, marginBottom: 8 }}>{t("الأصناف المنقولة", "Items being transported")}</div>
+          <table>
+            <thead><tr><th style={th}>{t("الصنف", "Item")}</th><th style={th}>{t("الكمية", "Qty")}</th></tr></thead>
+            <tbody>
+              {req.lines.map((l, i) => (
+                <tr key={i}><td style={td}>{lang === "ar" ? l.itemName : (l.itemNameEn || l.itemName)}</td><td style={{ ...td, fontWeight: 700 }}>{fmt(l.qtyApproved)} {l.unit}</td></tr>
+              ))}
+            </tbody>
+          </table>
+          <div style={{ display: "flex", justifyContent: "space-between", marginTop: 40, fontSize: 12.5 }}>
+            <div style={{ textAlign: "center", flex: 1 }}>
+              <div style={{ borderTop: "1px solid " + C.text, width: 130, margin: "0 auto 6px" }} />
+              {t("توقيع التسليم (المستودع/السائق)", "Handover signature (Warehouse/Driver)")}
+            </div>
+            <div style={{ textAlign: "center", flex: 1 }}>
+              <div style={{ borderTop: "1px solid " + C.text, width: 130, margin: "0 auto 6px" }} />
+              {t("توقيع الاستلام (الفرع)", "Receipt signature (Branch)")}
+            </div>
+          </div>
+          <div style={{ marginTop: 24, fontSize: 11, color: C.muted, textAlign: "center" }}>{t("هذا الإيصال بيتنقّل مع البضاعة، ولازم يتوقّع عليه عند التسليم والاستلام لتوثيق النقل.", "This receipt travels with the goods, and must be signed at handover and receipt to document the transfer.")}</div>
         </div>
         <div style={{ display: "flex", gap: 10, justifyContent: "center", marginTop: 20 }} className="no-print">
           <button onClick={() => window.print()} style={smallBtn}>🖨️ {t("طباعة", "Print")}</button>
@@ -3578,7 +3676,8 @@ function MainWarehouseCountTab({ currentUser, meta, lang, t }) {
         const systemQty = Number(it.qty) || 0;
         const diff = countedQty - systemQty;
         await COUNTS_COL.add({
-          branch: MAIN_WH_LABEL, itemId: it.id, itemName: it.nameAr, systemQty, countedQty, diff, date: todayStr(),
+          branch: MAIN_WH_LABEL, itemId: it.id, itemName: it.nameAr, systemQty, countedQty, diff,
+          price: Number(it.price) || 0, diffValue: diff * (Number(it.price) || 0), date: todayStr(),
           countedBy: currentUser.name, institutionId: DEFAULT_INSTITUTION_ID, createdAt: firebase.firestore.FieldValue.serverTimestamp(),
         });
         await ITEMS_COL.doc(it.id).update({ qty: countedQty }); // الجرد بيصحّح رصيد المستودع الرئيسي مباشرة
@@ -3627,22 +3726,31 @@ function MainWarehouseCountTab({ currentUser, meta, lang, t }) {
             </div>
           ) : (
           <table>
-            <thead><tr><th style={th}>{t("الصنف", "Item")}</th><th style={th}>🏢 {t("الكيان", "Entity")}</th><th style={th}>{t("رصيد النظام", "System qty")}</th><th style={th}>{t("الكمية الفعلية المجرودة", "Actual counted qty")}</th><th style={th}>{t("الفرق", "Diff")}</th></tr></thead>
+            <thead><tr>
+              <th style={th}>{t("الصنف", "Item")}</th><th style={th}>🏢 {t("الكيان", "Entity")}</th>
+              <th style={th}>{t("رصيد النظام (كمية)", "System (qty)")}</th><th style={th}>{t("رصيد النظام (مبلغ)", "System (value)")}</th>
+              <th style={th}>{t("الفعلي المجرود", "Counted")}</th><th style={th}>{t("فرق الكمية", "Qty diff")}</th><th style={th}>{t("فرق المبلغ", "Value diff")}</th>
+            </tr></thead>
             <tbody>
               {filteredItems.slice(0, 300).map((it) => {
                 const c = counted[it.id];
-                const diff = c !== undefined && c !== "" ? Number(c) - Number(it.qty) : null;
+                const hasCount = c !== undefined && c !== "";
+                const diff = hasCount ? Number(c) - Number(it.qty) : null;
+                const price = Number(it.price) || 0;
+                const diffValue = hasCount ? diff * price : null;
                 return (
                   <tr key={it.id}>
                     <td style={{ ...td, fontWeight: 700 }}>{lang === "ar" ? (it.nameAr || it.nameEn) : (it.nameEn || it.nameAr)}</td>
                     <td style={td}>{it.institution || "—"}</td>
                     <td style={td}>{fmt(it.qty)} {it.unit}</td>
+                    <td style={td}>{fmt(it.qty * price)} {t("ر.س", "SAR")}</td>
                     <td style={td}><input type="number" step="0.01" value={c || ""} onChange={(e) => setCountedQty(it.id, e.target.value)} style={{ ...inputStyle2, width: 110 }} /></td>
                     <td style={{ ...td, fontWeight: 700, color: diff === null ? C.muted : diff < 0 ? C.danger : diff > 0 ? C.success : C.muted }}>{diff === null ? "—" : (diff > 0 ? "+" : "") + fmt(diff)}</td>
+                    <td style={{ ...td, fontWeight: 700, color: diffValue === null ? C.muted : diffValue < 0 ? C.danger : diffValue > 0 ? C.success : C.muted }}>{diffValue === null ? "—" : (diffValue > 0 ? "+" : "") + fmt(diffValue)}</td>
                   </tr>
                 );
               })}
-              {filteredItems.length === 0 && <tr><td colSpan={5} style={{ ...td, textAlign: "center", color: "#9ca3af" }}>{t("لا يوجد أصناف", "No items")}</td></tr>}
+              {filteredItems.length === 0 && <tr><td colSpan={7} style={{ ...td, textAlign: "center", color: "#9ca3af" }}>{t("لا يوجد أصناف", "No items")}</td></tr>}
             </tbody>
           </table>
           )}
@@ -4887,7 +4995,14 @@ function App() {
           <BranchRequestTab currentUser={currentUser} meta={meta} lang={lang} t={t} whMeta={whMeta}
             isWhAdmin={canManageWarehouse(currentUser, whMeta)}
             canConfirmReceipt={canRequestForBranch(currentUser, whMeta)}
-            entityManagerFor={isEntityManagerOnly(currentUser, whMeta) ? getUserEntityRestriction(currentUser, whMeta) : ""} />
+            entityManagerFor={isEntityManagerOnly(currentUser, whMeta) ? getUserEntityRestriction(currentUser, whMeta) : ""}
+            selfApproveEntity={(() => {
+              // لو الموظف مقيّد بفرع (يعني مسؤول عن فرعه) ومفيش أي حد متعيّن "مدير كيان" لكيانه، يقدر يوافق على طلباته هو بنفسه في مرحلة الكيان
+              const myEntity = getUserEntityRestriction(currentUser, whMeta);
+              const myBranch = getUserBranchRestriction(currentUser, whMeta);
+              if (!myEntity || !myBranch) return "";
+              return hasEntityManagerFor(myEntity, users, whMeta) ? "" : myEntity;
+            })()} />
         )}
         {effectiveTab === "quickscan" && <QuickScanTab currentUser={currentUser} meta={meta} lang={lang} t={t} institutionName={DEFAULT_INSTITUTION_NAME} />}
         {effectiveTab === "mainCount" && canManageWarehouse(currentUser, whMeta) && <MainWarehouseCountTab currentUser={currentUser} meta={meta} lang={lang} t={t} />}
